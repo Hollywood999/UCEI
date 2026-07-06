@@ -6,3 +6,5 @@ isotropic.gcode
 venv
 .venv/
 env/
+__pycache__/
+offset.gcode
