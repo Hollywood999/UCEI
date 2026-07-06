@@ -1,4 +1,5 @@
 import tkinter as tk
+import customtkinter as ctk
 from tkinter import ttk
 from tkinter import messagebox as mb
 import sys
@@ -16,10 +17,10 @@ from shapely.affinity import rotate, translate
 # =========================
 # CONFIG
 # =========================
-CANVAS_W = 500
-CANVAS_H = 500
+CANVAS_W = 420
+CANVAS_H = 420
 SPRAYER_WIDTH = 2.5   # in millimeters; 2.5 is default for ucei sprayer
-FEEDRATE = 1000
+FEEDRATE = 1000  #default
 OVERRUN = 0
 NUM_PASSES = 1
 BRUSH_ANGLE = 30  #in degrees
@@ -36,12 +37,15 @@ CENTIMETERS = "cm"
 MILLIMETERS = "mm"
 INCHES = "in"
 path_file = ""
+CURRENT_X = 0.0
+CURRENT_Y = 0.0
+CURRENT_Z = 0.0
 shape_to_draw = None
 ARDUINO_PORT = '/dev/ttyACM0'
 # ARDUINO_PORT = '/dev/cu.usbmodem11301' # woodpecker arduino - initial prototype
 OCTOPRINT_PORT = 5001
 OCTOPRINT_URL = f"http://127.0.0.1:{OCTOPRINT_PORT}/"
-API_KEY = "r2W1qV4ZPIbhz9h5-Oj2syPf_bktfvAgTiDMi8kwgQ4"
+API_KEY = "ErDYaK23QBxF7Ka27f9zHV2sTz8MAHNWF76mROEJiuw"
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
 logger = logging.getLogger()
 
@@ -304,6 +308,7 @@ def raster_paths(poly, spacing, overrun=None):
 
 def offset_raster_path(poly, spacing, numofpasses=1):
     all_paths = []
+    print(numofpasses)
     for i in np.arange(0, spacing, spacing/numofpasses):
         print("I: ", i)
         rot = translate(poly, xoff=0, yoff=i)
@@ -318,6 +323,8 @@ def offset_raster_path(poly, spacing, numofpasses=1):
                 restored.append(p_final.coords[0])
             if len(restored) >= 2:
                 all_paths.append(restored)
+        if i < numofpasses - 1:
+                original_paths.append("DWELL")
     return all_paths
 
 
@@ -433,21 +440,22 @@ def write_gcode(filename, paths):
     
 
     #checks for specified z height
-    try:
-        zheight = heightEntry.get()
-        if not zheight: # If the textbox is empty
-            pass
-        else:
-            if int(zheight) >= 0 and int(zheight) <= 35:
-                z_start = int(zheight)
-            else:
-                z_start = 0
-                logger.warning("Invalid height, defaulting to 0.")
-    except (ValueError, NameError):
-        # If the input isn't a number or the textbox isn't found
-        z_start = 0
-        logger.warning("Invalid or missing height, defaulting to 0.")
+    # try:
+    #     zheight = heightEntry.get()
+    #     if not zheight: # If the textbox is empty
+    #         pass
+    #     else:
+    #         if int(zheight) >= 0 and int(zheight) <= 35:
+    #             z_start = int(zheight)
+    #         else:
+    #             z_start = 0
+    #             logger.warning("Invalid height, defaulting to 0.")
+    # except (ValueError, NameError):
+    #     # If the input isn't a number or the textbox isn't found
+    #     z_start = 0
+    #     logger.warning("Invalid or missing height, defaulting to 0.")
 
+    z_start = 0
     # ~ xnew = x_start - (z_start*math.tan(math.radians(BRUSH_ANGLE)))  #dynamic homing with zheight
     xnew = x_start    #comment out if you using line above ^
     
@@ -456,27 +464,13 @@ def write_gcode(filename, paths):
         f.write("G21\n")      # mm
         f.write("G90\n")      # absolute
         f.write("M211 S0\n")      # disables software endstops
-        f.write("G28 X Y\n")
+        f.write("G28 X Y\n")  #Moves to machine home (where limit switches click)
         f.write("G92 Z0\n")  #remove once we get limit switches
-        #f.write("G1 Z1\n")    # moving z axes to ensure octoprint accepts gcode
-        #f.write(f"G0 X{125+OVERRUN} Y{89-OVERRUN} Z11 F{FEEDRATE}\n")
-        f.write(f"G0 X{xnew:.1f} Y{y_start} Z{z_start} F{FEEDRATE}\n")
-        
-        f.write(f"G92 X0 Y0 Z0\n") 
-        #f.write(f"G0 X0 Y0\n") 
-        #f.write(f"G92 X-{OVERRUN} Y-{OVERRUN} Z0\n")
-        # f.write("G28\n")          # Home all axes
-        
-        #if paths and paths[0]:
-            #start_x, start_y = paths[0][0]
-            #f.write(f"G0 X{start_x:.2f} Y{start_y:.2f}\n")
-        
-        
-        #f.write("G1 Z0\n")    # safe height
-
-        # Optional: wait for heater
-        # f.write("M104 S60\n")    # Set temp (example)
-        # f.write("M109 S60\n")    # Wait for temp
+        f.write("G0 Z1\n")
+        f.write("G0 Z-1\n")
+        # f.write(f"G92 X Y\n")     # moves to work home. work home set by user
+        f.write("G54\n")
+        f.write("G0 X0 Y0\n")
 
         E=0 #needed for extrusion. octoprint is for 3d printers so if extrusion isn't mentioned, it thinks that nothing is happening
 
@@ -488,7 +482,7 @@ def write_gcode(filename, paths):
                 f.write("G4 S5\n")    # 2. Dwell for 5 seconds
                 continue               # 3. Move to the next pass (45 degrees)    
             x0, y0 = path[0]
-            x_end, y_end = path[-1]
+            # x_end, y_end = path[-1]
 
             f.write(f"G0 X{x0:.2f} Y{y0:.2f}\n")
 
@@ -496,24 +490,25 @@ def write_gcode(filename, paths):
             f.write("M280 P0 S0\n")
             f.write("G4 P250\n")  #Dwell 250ms for servo to move
 
-            step_size = 5.0 #5 mm
-            servo_clogging_angle = 3
-            dist = math.hypot(x_end - x0, y_end - y0)
-            num_segments = max(1, int(dist / step_size))
+            # # used for servo jitter to prevent clogging
+            # step_size = 5.0 #5 mm
+            # servo_clogging_angle = 3
+            # dist = math.hypot(x_end - x0, y_end - y0)
+            # num_segments = max(1, int(dist / step_size))
 
-            for i in range(1, num_segments+1):
-                E+=1
-                x = x0 + (x_end-x0) * (i/num_segments)
-                y = y0 + (y_end-y0) * (i/num_segments)
-
-                f.write(f"M280 P0 S{servo_angle + servo_clogging_angle}\n")
-                f.write(f"G1 X{x:.2f} Y{y:.2f} E{E} F{FEEDRATE}\n")
-
-                servo_clogging_angle *= -1
-            
-            # for x, y in path:
+            # for i in range(1, num_segments+1):
             #     E+=1
+            #     x = x0 + (x_end-x0) * (i/num_segments)
+            #     y = y0 + (y_end-y0) * (i/num_segments)
+
+            #     f.write(f"M280 P0 S{servo_angle + servo_clogging_angle}\n")
             #     f.write(f"G1 X{x:.2f} Y{y:.2f} E{E} F{FEEDRATE}\n")
+
+            #     servo_clogging_angle *= -1
+            
+            for x, y in path:
+                E+=1
+                f.write(f"G1 X{x:.2f} Y{y:.2f} E{E} F{FEEDRATE}\n")
 
             # Spray ON
             f.write(f"M280 P0 S{servo_angle}\n")
@@ -523,7 +518,6 @@ def write_gcode(filename, paths):
         f.write("G4 P250\n")  #Dwell 250ms for servo to move
 
         # ===== Shutdown =====
-        # f.write("G0 Z5\n")
         # Return to origin
         f.write("G28 X Y\n")
         f.write(f"G1 Z-{z_start}\n")
@@ -531,42 +525,7 @@ def write_gcode(filename, paths):
 
         logger.info(f"Gcode file is generated with servo angle:{servo_angle}")
 
-def move_servo():  #updated marlin function
-    global ser
-    angle = servoDegreetb.get()
-    if angle == "" or not isinstance(int(angle), int):  # no input / incorrect value
-        logger.warning("Please input a valid integer")
-        new_angle = 0
-        return
-    elif int(angle) >= 0 and int(angle) <= 270: #valid angle set
-        new_angle = int(angle)
-        logger.info(f"New angle = {new_angle}")
-        
-        headers = {
-            "X-Api-Key": API_KEY,
-            "Content-Type": "application/json"
-        }
-        
-        commands = [f"M280 P0 S{new_angle}","G4 S3", "M280 P0 S0"]
-        
-        #payload = {"commands": commands}
-        
-        payload = {"command": f"M280 P0 S{new_angle}"}
 
-        try:
-            response = requests.post(f"{OCTOPRINT_URL}api/printer/command", headers=headers, json=payload)
-            if response.status_code == 204:
-                logger.info("Successfully sent servo command to OctoPrint!")
-            else:
-                logger.error(f"Error: {response.status_code} - {response.text}")
-        except Exception as e:
-            logger.error(f"Failed to connect to OctoPrint / move servo: {e}")
-
-    else:  # if angle specified is too high or low / invalid input, pass 
-        new_angle = 0
-        logger.warning("Inputted integer outside of bounds. Select an angle between 0 & 270")
-        return
-    return
 
 # def heat_bed():  #updated marlin function
 #     global ser
@@ -638,6 +597,88 @@ def default_rect_path_generator():
 ##########################
 # HELPER FUNCTIONS
 ##########################
+def move_servo():  #updated marlin function
+    global ser
+    angle = servoDegreetb.get()
+    if angle == "" or not isinstance(int(angle), int):  # no input / incorrect value
+        logger.warning("Please input a valid integer")
+        new_angle = 0
+        return
+    elif int(angle) >= 0 and int(angle) <= 270: #valid angle set
+        new_angle = int(angle)
+        logger.info(f"New angle = {new_angle}")
+        
+        headers = {
+            "X-Api-Key": API_KEY,
+            "Content-Type": "application/json"
+        }
+        
+        commands = [f"M280 P0 S{new_angle}","G4 S3", "M280 P0 S0"]
+        
+        payload = {"commands": commands}
+        
+        # payload = {"command": f"M280 P0 S{new_angle}"}
+
+        try:
+            response = requests.post(f"{OCTOPRINT_URL}api/printer/command", headers=headers, json=payload)
+            if response.status_code == 204:
+                logger.info("Successfully sent servo command to OctoPrint!")
+            else:
+                logger.error(f"Error: {response.status_code} - {response.text}")
+        except Exception as e:
+            logger.error(f"Failed to connect to OctoPrint / move servo: {e}")
+
+    else:  # if angle specified is too high or low / invalid input, pass 
+        new_angle = 0
+        logger.warning("Inputted integer outside of bounds. Select an angle between 0 & 270")
+        return
+    return
+
+def update_gui_coordinates():
+    # print(x_coord_str)
+    x_coord_str.set(f"X: {CURRENT_X:.1f} mm")
+    y_coord_str.set(f"Y: {CURRENT_Y:.1f} mm")
+    z_coord_str.set(f"Z: {CURRENT_Z:.1f} mm")
+    
+    # Refresh every 250 milliseconds
+    root.after(500, update_gui_coordinates)
+
+def jog_machine(event):
+    global CURRENT_X, CURRENT_Y, CURRENT_Z
+    displacement = jog_option.get()
+    logger.debug(f"User clicked {displacement} and {event}")
+    commands = []
+    headers = {
+            "X-Api-Key": API_KEY,
+            "Content-Type": "application/json"
+        }
+    if event=="MOVE":
+        commands = [f"G0 X{CURRENT_X} Y{CURRENT_Y}"]
+    elif event=="HOME":
+        commands = [f"G10 L2 P1 X{CURRENT_X} Y{CURRENT_Y}", "G54"]
+    elif event[-1] == "-":
+        commands=["G21", "G91", f"G0 {event}{displacement[:-2]}", "G90"]
+        if event[0]=="X": CURRENT_X -= float(displacement[:-2])
+        elif event[0]=="Z": CURRENT_Z -= float(displacement[:-2])
+        else: CURRENT_Y -= float(displacement[:-2])
+    else:
+        commands=["G21", "G91", f"G0 {event[:-1]}{displacement[:-2]}", "G90"]
+        if event[0]=="X": CURRENT_X += float(displacement[:-2])
+        elif event[0]=="Z": CURRENT_Z += float(displacement[:-2])
+        else: CURRENT_Y += float(displacement[:-2])
+
+    print(CURRENT_X, CURRENT_Y)
+    payload = {"commands": commands}
+
+    try:
+        response = requests.post(f"{OCTOPRINT_URL}api/printer/command", headers=headers, json=payload)
+        if response.status_code == 204:
+            logger.info("Successfully sent jog command to OctoPrint!")
+        else:
+            logger.error(f"Error: {response.status_code} - {response.text}")
+    except Exception as e:
+        logger.error(f"Failed to connect to OctoPrint / move machine: {e}")
+
 def is_integer(s):
     try:
         int(s)
@@ -736,7 +777,6 @@ def open_in_candle(gcode_filename):
     else:
         print("Unsupported operating system")
 
-
 def open_in_octoprint(gcode_filename):
     # API endpoint for file uploads
     url = f"{OCTOPRINT_URL}api/files/local"
@@ -757,13 +797,31 @@ def open_in_octoprint(gcode_filename):
 
     webbrowser.open(OCTOPRINT_URL, autoraise=True, new=0)
 
+def get_width():
+    width = width_tb.get()
+    if width == "" or not is_float(width):
+        width=5
+    metric = metric_option.get()
+    logger.debug(f"Using metric: {metric}")
+    return metric_to_mm_converter(width, metric)
+
+def get_length():
+    length = length_tb.get()
+    if length == "" or not is_float(length):
+        length=5
+    metric = metric_option.get()
+    logger.debug(f"Using metric: {metric}")
+    return metric_to_mm_converter(length, metric)
+
 def shape_clicked(event): #executed when shape from listbox is selected
     global shape_to_draw
     global shape_original_coords  # these are the coordinates before moving the shape on the canvas
-
+    
     #### check whether textbox has an input or not ###
-    selected_shape = lb.curselection()[0] #checks the index of the selected shape
-    shape = lb.get(selected_shape) #gets the text value of the selected shape
+    shape = lb.get() #gets the text value of the selected shape
+    if shape=="--":
+        shape = RECTANGLE
+        logger.info("No shape selected. Using rectangle as the default")
 
     canvas.delete("all") # delete previous drawing
 
@@ -771,23 +829,24 @@ def shape_clicked(event): #executed when shape from listbox is selected
     canvas_center_x = CANVAS_W // 2   
     canvas_center_y = CANVAS_H // 2
 
-    width = width_tb.get()
-    length = length_tb.get()
-    logger.debug(f"Width input is a float?: {is_float(width)}, Length input is a float?: {is_float(length)}")
+    shape_width = get_width()
+    shape_height = get_length()
+    # logger.debug(f"Width input is a float?: {is_float(width)}, Length input is a float?: {is_float(length)}")
 
-    if width == "" or length == "" or not is_float(width) or not is_float(length):
-        print("Using default value of 5 x 5")
-        width = 5
-        length = 5
+    # if width == "" or length == "" or not is_float(width) or not is_float(length):
+    #     logger.info("Using default value of 5W x 5L")
+    #     width = 5
+    #     length = 5
 
     metric = metric_option.get()
-    if metric == "Option 1": 
-        logger.warning("Please select a metric")
-        mb.showwarning("Warning!!", "Please select a metric")
-        return
-    shape_width = metric_to_mm_converter(width, metric)
-    shape_height = metric_to_mm_converter(length, metric)
-    logger.info(f"Shape Dimensions = {shape_width}W x {shape_height}L in mm.")
+    # logger.debug(f"Using metric: {metric}")
+    # if metric == "Option 1": 
+    #     logger.warning("Please select a metric")
+    #     mb.showwarning("Warning!!", "Please select a metric")
+    #     return
+    # shape_width = metric_to_mm_converter(width, metric)
+    # shape_height = metric_to_mm_converter(length, metric)
+    logger.info(f"Shape Dimensions = {shape_width}W x {shape_height}L.")
     # print(f"type: {type(shape_width)}, {type(shape_height)}")
 
     # Depending on shape selected, the canvas will display the shape
@@ -836,17 +895,17 @@ def shape_clicked(event): #executed when shape from listbox is selected
 
     return shape_to_draw
 
-def path_clicked(event): #executed when path from listbox is selected
+def path_clicked(event=None): #executed when path from listbox is selected
     global path_file
     global original_paths
     global NUM_PASSES
     #checks that a shape is selected first
-    if shape_to_draw == None:  
+    if shape_to_draw==None:  
         mb.showwarning("Warning!!", "Please select a shape")
         return
     
-    selected_path = path_lb.curselection()[0] #curselection outputs a tuple of ints; takes the first element
-    path_selected = path_lb.get(selected_path) # gets the text associated with element
+    path_selected = path_lb.get() #curselection outputs a tuple of ints; takes the first element
+    # path_selected = path_lb.get(selected_path) # gets the text associated with element
     logger.debug(f"Selected Path: {path_selected}")
 
     coords = canvas.coords(shape_to_draw) #gets coordinates of the drawn shape on the canvas
@@ -854,7 +913,7 @@ def path_clicked(event): #executed when path from listbox is selected
     x_0, y_0, x_1, y_1 = shape_original_coords 
 
     #checks the shape that the user has selected
-    selected_shape = lb.get(lb.curselection()[0])
+    selected_shape = lb.get()
     if selected_shape == RECTANGLE:
         poly = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])  #creates polygon object; necessary for shapely library; used for displaying in tkinter
         original_poly = Polygon([(x_0, y_0), (x_1, y_0), (x_1, y_1), (x_0, y_1)])  #used for accurate coordinates in Candle
@@ -945,7 +1004,7 @@ def path_clicked(event): #executed when path from listbox is selected
 
 
 # =========================
-# SETUP
+# SETUP  & SHUTDOWN
 # =========================
 def background_setup(): # connects to arduino and connects printer to octoprint
     # OPEN arduino connection once at the start
@@ -978,6 +1037,19 @@ def background_setup(): # connects to arduino and connects printer to octoprint
         logger.error(f"Failed to connect to OctoPrint/printer: {e}")
 
 
+    payload = {"commands": ["G28 X Y"]}
+    try:
+        response = requests.post(f"{OCTOPRINT_URL}api/printer/command", headers=headers, json=payload)
+        if response.status_code == 204:
+            logger.info("Successfully sent jog command to OctoPrint!")
+        else:
+            logger.error(f"Error: {response.status_code} - {response.text}")
+    except Exception as e:
+        logger.error(f"Failed to connect to OctoPrint / move machine: {e}")
+
+    
+    # update_gui_coordinates()
+    
 def on_closing():
     global ser
     try:
@@ -986,17 +1058,19 @@ def on_closing():
     except:
         print("Serial is not connected, nothing to close\n")
     # root.destroy()
-    # generate_button.config(state="disabled")
-    
+    # generate_button.config(state="disabled") 
 
 def finish(): # Runs when the finish shape button is clicked
-    global path_file
-    global original_paths
-    if len(path_lb.curselection()) == 0:  #checks that a shape is selected first
+    global path_file, original_paths, CURRENT_X, CURRENT_Y
+
+    if path_lb.get() == "--":  #checks that a shape is selected first
         mb.showwarning("Warning!!", "Please select a path")
         return
     print(path_file)
+    path_clicked()
     write_gcode(path_file, original_paths)
+    # CURRENT_X = 0.0
+    # CURRENT_Y = 0.0
     logger.info(f"{path_file} generated")
     open_in_octoprint(f"/home/ucei/Documents/UCEI/{path_file}")
     on_closing()
@@ -1010,141 +1084,245 @@ def finish(): # Runs when the finish shape button is clicked
 
 #### SETUP #####
 background_setup() #connects to arduino and octoprint server
+# update_gui_coordinates()
 
-root = tk.Tk()
+ctk.set_default_color_theme("dark-blue")
+
+root = ctk.CTk()
 root.title("Draw Substrate Boundary")
 
-# ##### White Canvas above selectors
-canvas = tk.Canvas(root, width=CANVAS_W, height=CANVAS_H, bg="white")
-canvas.grid(row = 0, column=0) # Put the Canvas in row 0, col 0 
-# #####
+root.grid_columnconfigure(0, weight=1)
+root.grid_rowconfigure(0, weight=0) # Keeps tabview tight to the top
+root.grid_rowconfigure(1, weight=1)
 
-# Frame for the "Controls" on the right of canvas
-control_frame = tk.Frame(root)
-control_frame.grid(row=0, column=1, sticky="n")
+## TabView
+tabview = ctk.CTkTabview(master=root)
+tabview.grid(row=0, column=0, padx=0, pady=0, sticky="nw")
 
-###### DIMENSIONS SELECTION ######
-width_label = tk.Label(control_frame, font=("Lexend", 14), text="Enter width: ")
-width_label.grid(row=0, column=0)
+dim_tab = tabview.add("Dimensions")  # add tab at the end
+extra_tab = tabview.add("Additional")  # add tab at the end
 
-# # For inputting dimensions
-width_tb = tk.Entry(control_frame, width=15)
-width_tb.insert(0, "5")
-width_tb.grid(row=1, column=0)
+###### DIMENSIONS INPUT ######
+dimheading = ctk.CTkLabel(
+            dim_tab, 
+            text="Dimensions", 
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("black", "white")
+        )
+dimheading.grid(row=0, column=0, padx=(4, 10), sticky="w")
 
-length_label = tk.Label(control_frame, font=("Lexend", 14), text="Enter length: ")
-length_label.grid(row=2, column=0)
-length_tb = tk.Entry(control_frame, width=15)
-length_tb.insert(0, "5")
-length_tb.grid(row=3, column=0)
+dimheadingline = ctk.CTkFrame(
+            dim_tab, 
+            height=1, 
+            # fg_color="#dbdbdb"
+            fg_color=("black", "white")
+        )
+dimheadingline.grid(row=0, column=1, padx=(0, 5), pady=(4, 0), sticky="ew")
 
-metric_option = tk.StringVar(value="Option 1")
-rb1 = ttk.Radiobutton(control_frame, text="mm", variable=metric_option, value="mm")
-rb1.grid(row=1, column=1, sticky="w")
+input_frame = ctk.CTkFrame(dim_tab, fg_color="transparent")
+input_frame.grid(row=1, column=0, columnspan=2, padx=10, pady=0, sticky="ew")
 
-rb2 = ttk.Radiobutton(control_frame, text="cm", variable=metric_option, value="cm")
-rb2.grid(row=2, column=1, sticky="w")
+width_label = ctk.CTkLabel(input_frame, text="Width:", font=ctk.CTkFont(size=12, weight="normal"))
+width_label.grid(row=0, column=0, pady=2, sticky="w")
+width_tb = ctk.CTkEntry(input_frame, height=5, width=100, placeholder_text="5")
+width_tb.grid(row=0, column=1, padx=(100, 0), pady=5, sticky="e")
 
-rb3 = ttk.Radiobutton(control_frame, text="in", variable=metric_option, value="in")
-rb3.grid(row=3, column=1, sticky="w")
-# tk.Button(control_frame, text="Set").grid(row=4, column=0)
-###### DIMENSIONS SELECTION ######
+length_label = ctk.CTkLabel(input_frame, text="Length:", font=ctk.CTkFont(size=12, weight="normal"))
+length_label.grid(row=1, column=0, pady=2, sticky="w")
+length_tb = ctk.CTkEntry(input_frame, height=5, width=100, placeholder_text="5")
+length_tb.grid(row=1, column=1, padx=(100, 0), pady=5, sticky="e")
 
+unit_var = ctk.StringVar(value="mm")
+metric_option = ctk.CTkSegmentedButton(
+    input_frame, 
+    values=["mm", "cm", "in"],
+    variable=unit_var,
+    dynamic_resizing=False,
+    width=150,
+    height=27
+)
+metric_option.grid(row=2, column=1, columnspan=2, pady=(7, 15), sticky="w")
 
-###### SHAPE SELECTION #######
-shape_label = tk.Label(control_frame, font=("Lexend", 14), text="Select a shape:")
-shape_label.grid(row=5, column=0, pady=(35, 0))
+###### SHAPE INPUT ######
+shape_header_frame = ctk.CTkFrame(dim_tab, fg_color="transparent")
+shape_header_frame.grid(row=2, column=0, columnspan=2, padx=0, pady=(0, 0), sticky="ew")
+# shape_header_frame.grid_columnconfigure(1, weight=1)
+shapeheading = ctk.CTkLabel(
+            shape_header_frame, 
+            text="Shape", 
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("black", "white")
+        )
+shapeheading.grid(row=0, column=0, columnspan=1, padx=(4, 10), sticky="w")
 
-# Listbox for selecting shapes
-lb = tk.Listbox(control_frame, height=3, width=15, exportselection=False)
-lb.grid(row=6, column=0)
-lb.insert(1, "Rectangle")
-lb.insert(3, "Circle")
-lb.bind("<<ListboxSelect>>", shape_clicked)
-##### SHAPE SELECTION #######
+shapeheadingline = ctk.CTkFrame(
+            shape_header_frame, 
+            height=1, 
+            # fg_color="#dbdbdb"
+            fg_color=("black", "white")
+        )
+shapeheadingline.grid(row=0, column=1, padx=(0, 5), pady=(4, 0), sticky="ew")
 
-###### PATH SELECTION #######
-path_label = tk.Label(control_frame, text="Select a path:")
-path_label.grid(row=7, column=0, pady=(10, 0))
+shape_frame = ctk.CTkFrame(shape_header_frame, fg_color="transparent")
+shape_frame.grid(row=4, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
 
-# Listbox for selecting path
-path_lb = tk.Listbox(control_frame, height=6, width=15, exportselection=False)
-path_lb.insert(1, SPIRAL)
-path_lb.insert(2, CROSSHATCH)
-path_lb.insert(3, ZIGZAG)
-path_lb.insert(4, ANGLED)
-path_lb.insert(5, ISOTROPIC)
-path_lb.insert(6, OFFSET_RASTER)
-path_lb.grid(row=8, column=0)
-path_lb.bind("<<ListboxSelect>>", path_clicked)
-###### PATH SELECTION #######
+shape_label = ctk.CTkLabel(shape_frame, font=("Lexend", 12), text="Select a shape:")
+shape_label.grid(row=0, column=0, pady=(0, 0), padx=(0, 30))
+lb = ctk.CTkOptionMenu(shape_frame, values=["--", "Rectangle", "Circle"],
+                       height=20, 
+                       command=shape_clicked)
+lb.grid(row=0, column=1)
+
+###### PATH INPUT ######
+path_header_frame = ctk.CTkFrame(dim_tab, fg_color="transparent")
+path_header_frame.grid(row=3, column=0, columnspan=2, padx=0, pady=(0, 0), sticky="ew")
+pathheading = ctk.CTkLabel(
+            path_header_frame, 
+            text="Path", 
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("black", "white")
+        )
+pathheading.grid(row=0, column=0, columnspan=1, padx=(4, 10), sticky="w")
+
+pathheadingline = ctk.CTkFrame(
+            path_header_frame, 
+            height=1, 
+            # fg_color="#dbdbdb"
+            fg_color=("black", "white")
+        )
+pathheadingline.grid(row=0, column=1, padx=(0, 5), pady=(4, 0), sticky="ew")
+
+path_frame = ctk.CTkFrame(path_header_frame, fg_color="transparent")
+path_frame.grid(row=6, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
+
+path_label = ctk.CTkLabel(path_frame, font=("Lexend", 12), text="Select a path:")
+path_label.grid(row=0, column=0, pady=(0, 0), padx=(0, 30))
+path_lb = ctk.CTkOptionMenu(path_frame, 
+                            values=["--", SPIRAL, CROSSHATCH, ZIGZAG, ANGLED, ISOTROPIC, OFFSET_RASTER],
+                            command=path_clicked,
+                            height=20)
+path_lb.grid(row=0, column=1)
 
 ###### SERVO DEGREE SELECTION #######
+servo_header_frame = ctk.CTkFrame(dim_tab, fg_color="transparent")
+servo_header_frame.grid(row=4, column=0, columnspan=2, padx=0, pady=(0, 0), sticky="ew")
+servoheading = ctk.CTkLabel(
+            servo_header_frame, 
+            text="Trigger", 
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("black", "white")
+        )
+servoheading.grid(row=0, column=0, columnspan=1, padx=(4, 10), sticky="w")
+
+servoheadingline = ctk.CTkFrame(
+            servo_header_frame, 
+            height=1, 
+            # fg_color="#dbdbdb"
+            fg_color=("black", "white")
+        )
+servoheadingline.grid(row=0, column=1, padx=(0, 0), pady=(4, 0), sticky="ew")
+
+servo_frame = ctk.CTkFrame(servo_header_frame, fg_color="transparent")
+servo_frame.grid(row=8, column=0, columnspan=2, padx=(15,0), pady=10, sticky="ew")
+
 # Textbox for servo degrees 
-servoDegreetb = tk.Entry(control_frame, width=15)
-servoDegreetb.grid(row=9, column=0, pady=(20, 0))
-tk.Button(control_frame, text="Move servo", command=move_servo).grid(row=10, column=0)
+servoDegreetb = ctk.CTkEntry(servo_frame, width=50, placeholder_text="0")
+servoDegreetb.grid(row=0, column=0, pady=(0, 0), padx=(0, 50), sticky="e")
+ctk.CTkButton(servo_frame, text="Move servo", command=move_servo).grid(row=0, column=1)
+
 ###### SERVO DEGREE SELECTION #######
+
 
 ###### NUM PASSES SELECTION #######
-passes_label = tk.Label(control_frame, font=("Lexend", 14), text="Num. of Passes: ")
-passes_label.grid(row=0, column=3, padx=(30, 10), pady=(20, 0))
+passes_frame = ctk.CTkFrame(extra_tab, fg_color="transparent")
+passes_frame.grid(row=0, column=0, columnspan=2, padx=(5,0), pady=(0, 0), sticky="ew")
 
-numPassestb = tk.Entry(control_frame, width=15)
+passes_label = ctk.CTkLabel(passes_frame, font=("Lexend", 13), text="Num. of Passes: ")
+passes_label.grid(row=0, column=0, padx=(5, 45), pady=(0, 0))
+
+numPassestb = ctk.CTkEntry(passes_frame, width=80, height=7)
 numPassestb.insert(0, str(NUM_PASSES))   # prefill with default
-numPassestb.grid(row=1, column=3)
+numPassestb.grid(row=0, column=1, padx=(40, 0))
 
-tk.Button(control_frame, text="Set Passes", command=setNumPasses).grid(row=2, column=3)
+ctk.CTkButton(passes_frame, width=45, text="Set Passes", command=setNumPasses).grid(row=1,
+                                                                                     column=1,  
+                                                                                     padx=(40,0),
+                                                                                     pady=(5, 15),
+                                                                                     columnspan=2)
 ###### NUM PASSES SELECTION #######
 
 ###### SPRAYER WIDTH SELECTION #######
-width_input_label = tk.Label(control_frame, font=("Lexend", 14), text="Sprayer Width (mm): ")
-width_input_label.grid(row=3, column=3, padx=(30, 10), pady=(20, 0))
+width_frame = ctk.CTkFrame(extra_tab, fg_color="transparent")
+width_frame.grid(row=1, column=0, columnspan=2, padx=(5,0), pady=(10, 0), sticky="ew")
 
-sprayerWidthtb = tk.Entry(control_frame, width=15)
+width_input_label = ctk.CTkLabel(width_frame, font=("Lexend", 13), text="Sprayer Width (mm): ")
+width_input_label.grid(row=0, column=0, padx=(5, 22), pady=(0, 0))
+
+sprayerWidthtb = ctk.CTkEntry(width_frame,  width=80, height=7)
 sprayerWidthtb.insert(0, str(SPRAYER_WIDTH))   # prefill with default
-sprayerWidthtb.grid(row=4, column=3)
+sprayerWidthtb.grid(row=0, column=1, padx=(35, 0))
 
-tk.Button(control_frame, text="Set Width", command=setSprayerWidth).grid(row=5, column=3)
+ctk.CTkButton(width_frame, width=45, text="Set Width", command=setSprayerWidth).grid(row=1, 
+                                                                                     column=1,
+                                                                                     padx=(35,0),
+                                                                                     pady=(5, 15),
+                                                                                     columnspan=2)
 ###### SPRAYER WIDTH SELECTION #######
 
 ###### OVERRUN SELECTION #######
-overrun_label = tk.Label(control_frame, font=("Lexend", 14), text="Overrun (mm):")
-overrun_label.grid(row=6, column=3, padx=(30, 10), pady=0)
+overrun_frame = ctk.CTkFrame(extra_tab, fg_color="transparent")
+overrun_frame.grid(row=2, column=0, columnspan=2, padx=(5,0), pady=(10, 0), sticky="ew")
 
-overruntb = tk.Entry(control_frame, width=15)
+overrun_label = ctk.CTkLabel(overrun_frame, font=("Lexend", 13), text="Overrun (mm):")
+overrun_label.grid(row=0, column=0, padx=(5, 50), pady=(0, 0))
+
+overruntb = ctk.CTkEntry(overrun_frame, width=80, height=7)
 overruntb.insert(0, str(OVERRUN))   # prefill with default
-overruntb.grid(row=7, column=3, padx=(30, 10))
+overruntb.grid(row=0, column=1, padx=(50, 0))
 
-tk.Button(control_frame, text="Set Overrun", command=setOverrun).grid(row=8, column=3, padx=(20, 0), pady=0)
+ctk.CTkButton(overrun_frame, width=45, text="Set Overrun", command=setOverrun).grid(row=1, 
+                                                                                    column=1,
+                                                                                    padx=(48,0),
+                                                                                    pady=(5, 15),
+                                                                                    columnspan=2)
 ###### OVERRUN SELECTION #######
 
 ###### FEEDRATE SELECTION #######
-feedrate_label = tk.Label(control_frame, font=("Lexend", 14), text="Feedrate (mm/min):")
-feedrate_label.grid(row=9, column=3, padx=(30, 10), pady=(20, 0))
+feedrate_frame = ctk.CTkFrame(extra_tab, fg_color="transparent")
+feedrate_frame.grid(row=3, column=0, columnspan=2, padx=(5,0), pady=(10, 0), sticky="ew")
 
-feedratetb = tk.Entry(control_frame, width=15)
+feedrate_label = ctk.CTkLabel(feedrate_frame, font=("Lexend", 13), text="Feedrate (mm/min):")
+feedrate_label.grid(row=0, column=0, padx=(5, 25), pady=(0, 0))
+
+feedratetb = ctk.CTkEntry(feedrate_frame, width=80, height=7)
 feedratetb.insert(0, str(FEEDRATE))   # prefill with default
-feedratetb.grid(row=10, column=3, padx=(30, 10))
+feedratetb.grid(row=0, column=1, padx=(45, 10))
 
-tk.Button(control_frame, text="Set Feedrate", command=setFeedrate).grid(row=11, column=3, padx=(20, 0))
+ctk.CTkButton(feedrate_frame, width=45, text="Set Feedrate", command=setFeedrate).grid(row=1, 
+                                                                                       column=1,
+                                                                                       padx=(40,0),
+                                                                                       pady=(5, 15),
+                                                                                       columnspan=2)
 ###### FEEDRATE SELECTION #######
 
-###### HEIGHT SELECTION #######
-# Textbox for servo degrees 
-height_label = tk.Label(control_frame, text="Z height:")
-height_label.grid(row=12, column=3, padx=(30, 10), pady=(20, 0))
-heightEntry = tk.Entry(control_frame, width=15)
-heightEntry.grid(row=13, column=3)
-# tk.Button(control_frame, text="Move servo", command=move_servo).grid(row=10, column=0)
-###### SERVO SELECTION #######
+# ###### HEIGHT SELECTION #######
+# height_frame = ctk.CTkFrame(extra_tab, fg_color="transparent")
+# height_frame.grid(row=4, column=0, columnspan=2, padx=(15,0), pady=(0, 0), sticky="ew")
 
-generate_button = tk.Button(control_frame, text="Generate!", command=finish)
-generate_button.grid(row=14, column=3, padx=(30, 10), pady=(25, 0))
+# height_label = ctk.CTkLabel(height_frame, text="Z height:")
+# height_label.grid(row=0, column=0, padx=(0, 10), pady=(0, 0))
+
+# heightEntry = ctk.CTkEntry(height_frame, width=15)
+# heightEntry.grid(row=0, column=1)
+# # tk.Button(control_frame, text="Move servo", command=move_servo).grid(row=10, column=0)
+# ###### HEIGHT SELECTION #######
+
+generate_button = ctk.CTkButton(root, text="Generate!", command=finish)
+generate_button.grid(row=1, column=0, pady=(0, 10))
 
 ###### LOG / FEEDBACK BOX #######
 log_frame = tk.Frame(root)
-log_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=5)
+log_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=10, pady=5)
 
 tk.Label(log_frame, text="Log:", font=("Lexend", 12)).pack(anchor="w")
 
@@ -1159,6 +1337,76 @@ gui_handler = TextLogHandler(log_box)
 gui_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
 logger.addHandler(gui_handler)
 ###### LOG / FEEDBACK BOX #######
+
+# ##### White Canvas above selectors
+canvas = tk.Canvas(root, width=CANVAS_W, height=CANVAS_H, bg="white")
+canvas.grid(row = 0, column=1) # Put the Canvas in row 0, col 0 
+# #####
+
+##### Jog Panel #######
+jog_panel = ctk.CTkFrame(root, fg_color="transparent", width=270)
+jog_panel.grid_propagate(False)
+jog_panel.grid(row=0, column=2, padx=(20, 20), pady=(30, 0), sticky="nswe")
+
+jog_panel.grid_columnconfigure(0, weight=1)
+jog_panel.grid_columnconfigure(1, weight=1)
+jog_panel.grid_columnconfigure(2, weight=1)
+
+jog_panel.grid_rowconfigure(0, weight=1)  # Top buffer spring
+jog_panel.grid_rowconfigure(5, weight=1)  # Bottom buffer spring
+
+# jogpanel_label = ctk.CTkLabel(jog_panel, font=ctk.CTkFont(size=15, weight="bold"), text="Work Home Coordinates:")
+# jogpanel_label.grid(row=0, columnspan=3, column=0)
+
+workhome_move = ctk.CTkButton(jog_panel, text="Current Work Home", width=30, height=30, command=lambda: jog_machine("MOVE"))
+workhome_move.grid(row=0, column=0, columnspan=3, pady=(20), padx=(0, 0))
+
+xbutton_left = ctk.CTkButton(jog_panel, text="◀", width=40, height=40, command=lambda: jog_machine("X-"))
+xbutton_left.grid(row=2, column=0, pady=(20), sticky="ns")
+xbutton_right = ctk.CTkButton(jog_panel, text="▶", width=40, height=40, command=lambda: jog_machine("X+"))
+xbutton_right.grid(row=2, column=2, pady=(20))
+
+ybutton_top = ctk.CTkButton(jog_panel, text="▲", width=40, height=40, command=lambda: jog_machine("Y+"))
+ybutton_top.grid(row=1, column=1, padx=(20), pady=(0, 0))
+ybutton_bottom = ctk.CTkButton(jog_panel, text="▼", width=40, height=40, command=lambda: jog_machine("Y-"))
+ybutton_bottom.grid(row=3, column=1, padx=(20), pady=(0, 0))
+
+zbutton_top = ctk.CTkButton(jog_panel, text="▲", width=40, height=40, command=lambda: jog_machine("Z+"))
+zbutton_top.grid(row=1, column=3, padx=(35, 0), pady=(0, 0))
+zbutton_bottom = ctk.CTkButton(jog_panel, text="▼", width=40, height=40, command=lambda: jog_machine("Z-"))
+zbutton_bottom.grid(row=3, column=3, padx=(35, 0), pady=(0, 0))
+
+workhome_button = ctk.CTkButton(jog_panel, font=("Lexend", 25), text="⌂", width=50, height=50, command=lambda: jog_machine("HOME"))
+workhome_button.grid(row=2, column=1, pady=(0, 0))
+
+button_var = ctk.StringVar(value="1mm")
+jog_option = ctk.CTkSegmentedButton(
+    jog_panel, 
+    values=["1mm", "10mm", "100mm"],
+    variable=button_var,
+    dynamic_resizing=False,
+    width=170,
+    height=30
+)
+jog_option.grid(row=4, column=0, columnspan=3, padx=(10, 0), pady=(20, 0), sticky="w")
+
+x_coord_str = ctk.StringVar(value="X: 0.0 mm")
+y_coord_str = ctk.StringVar(value="Y: 0.0 mm")
+z_coord_str = ctk.StringVar(value="Z: 0.0 mm")
+
+x_display = ctk.CTkLabel(jog_panel, textvariable=x_coord_str, font=ctk.CTkFont(size=14, weight="bold"), text_color="#3b8ed0")
+x_display.grid(row=5, column=0, columnspan=2, padx=(0, 40))
+
+y_display = ctk.CTkLabel(jog_panel, textvariable=y_coord_str, font=ctk.CTkFont(size=14, weight="bold"), text_color="#3b8ed0")
+y_display.grid(row=5, column=1, columnspan=2, padx=(30,0))
+
+z_display = ctk.CTkLabel(jog_panel, textvariable=z_coord_str, font=ctk.CTkFont(size=14, weight="bold"), text_color="#3b8ed0")
+z_display.grid(row=5, column=2, columnspan=2, padx=(30,0))
+update_gui_coordinates()
+
+panel_note = ctk.CTkLabel(jog_panel, text="Click ⌂ to set the work home!")
+panel_note.grid(row=6, columnspan=3, column=0, pady=(5, 0))
+##### Jog Panel #######
 
 root.mainloop()
 
