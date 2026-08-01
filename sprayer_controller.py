@@ -41,11 +41,11 @@ CURRENT_X = 0.0
 CURRENT_Y = 0.0
 CURRENT_Z = 0.0
 shape_to_draw = None
-ARDUINO_PORT = '/dev/ttyACM0'
-# ARDUINO_PORT = '/dev/cu.usbmodem11301' # woodpecker arduino - initial prototype
-OCTOPRINT_PORT = 5001
-OCTOPRINT_URL = f"http://127.0.0.1:{OCTOPRINT_PORT}/"
-API_KEY = "ErDYaK23QBxF7Ka27f9zHV2sTz8MAHNWF76mROEJiuw"
+# Connection settings (Arduino port, OctoPrint URL/port, API key) live in
+# config.py and are selected by the UCEI_TARGET env var (default LOCAL, or PI).
+# For LOCAL the API key is read from config_local.py (git-ignored) so keys are
+# never committed.
+from config import ARDUINO_PORT, OCTOPRINT_PORT, OCTOPRINT_URL, API_KEY
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
 logger = logging.getLogger()
 
@@ -1008,12 +1008,15 @@ def path_clicked(event=None): #executed when path from listbox is selected
 # =========================
 def background_setup(): # connects to arduino and connects printer to octoprint
     # OPEN arduino connection once at the start
-    try:
-        ser = serial.Serial(ARDUINO_PORT, 250000)
-        logger.info("Successfully  connected to Servo")
-        time.sleep(2) # Wait for the reboot
-    except:
-        logger.error("Could not connect to arduino. Check the port name!")
+    if ARDUINO_PORT is None:
+        logger.info("No Arduino port configured for this target (UCEI_TARGET); skipping serial connection.")
+    else:
+        try:
+            ser = serial.Serial(ARDUINO_PORT, 250000)
+            logger.info("Successfully  connected to Servo")
+            time.sleep(2) # Wait for the reboot
+        except:
+            logger.error("Could not connect to arduino. Check the port name!")
 
     headers = {
         "X-Api-Key": API_KEY,
@@ -1072,7 +1075,9 @@ def finish(): # Runs when the finish shape button is clicked
     # CURRENT_X = 0.0
     # CURRENT_Y = 0.0
     logger.info(f"{path_file} generated")
-    open_in_octoprint(f"/home/ucei/Documents/UCEI/{path_file}")
+    # path_file is written to the current working directory by write_gcode;
+    # upload that same local file (previously a hardcoded Pi Linux path).
+    open_in_octoprint(path_file)
     on_closing()
 
 
@@ -1083,7 +1088,8 @@ def finish(): # Runs when the finish shape button is clicked
 ###################
 
 #### SETUP #####
-background_setup() #connects to arduino and octoprint server
+if __name__ == "__main__":
+    background_setup() #connects to arduino and octoprint server
 # update_gui_coordinates()
 
 ctk.set_default_color_theme("dark-blue")
@@ -1408,7 +1414,8 @@ panel_note = ctk.CTkLabel(jog_panel, text="Click ⌂ to set the work home!")
 panel_note.grid(row=6, columnspan=3, column=0, pady=(5, 0))
 ##### Jog Panel #######
 
-root.mainloop()
+if __name__ == "__main__":
+    root.mainloop()
 
 # =========================
 # GEOMETRY

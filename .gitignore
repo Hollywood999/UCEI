@@ -4,7 +4,11 @@ raster.gcode
 spiral.gcode
 isotropic.gcode
 venv
+octovenv/
 .venv/
 env/
 __pycache__/
 offset.gcode
+
+# Local secrets -- never commit API keys (see LOCAL profile in config.py)
+config_local.py
