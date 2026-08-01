@@ -438,6 +438,14 @@ def write_gcode(filename, paths):
         # If the input isn't a number or the textbox isn't found
         servo_angle = 0
         logger.warning("Invalid or missing servo angle, defaulting to 0.")
+
+    # Continuous Spray toggle (Additional-tab checkbox). When ON, the sprayer
+    # servo is turned on once at the start and off once after the final line,
+    # holding the angle through every travel move (no per-line toggles/dwells).
+    try:
+        continuous_spray = bool(continuous_spray_var.get())
+    except Exception:
+        continuous_spray = False
     
 
     #checks for specified z height
@@ -473,12 +481,19 @@ def write_gcode(filename, paths):
         f.write("G54\n")
         f.write("G0 X0 Y0\n")
 
+        # Continuous Spray: turn the sprayer ON once here and hold it through
+        # all travels; the per-line toggles below are skipped when continuous.
+        if continuous_spray:
+            f.write(f"M280 P0 S{servo_angle}\n")   # Spray ON (once, at path start)
+            f.write("G4 P250\n")                    #Dwell 250ms for servo to move
+
         E=0 #needed for extrusion. octoprint is for 3d printers so if extrusion isn't mentioned, it thinks that nothing is happening
 
         for path in paths:    
             print("path: ",path)
             if path == "DWELL":
-                f.write("M280 P0 S0\n") # Spray OFF
+                if not continuous_spray:
+                    f.write("M280 P0 S0\n") # Spray OFF (servo stays on across passes when continuous)
                 f.write("G0 X0 Y0\n") # 1. Park the nozzle at origin to avoid heat
                 f.write("G4 S5\n")    # 2. Dwell for 5 seconds
                 continue               # 3. Move to the next pass (45 degrees)    
@@ -487,9 +502,10 @@ def write_gcode(filename, paths):
 
             f.write(f"G0 X{x0:.2f} Y{y0:.2f}\n")
 
-            # Spray OFF
-            f.write("M280 P0 S0\n")
-            f.write("G4 P250\n")  #Dwell 250ms for servo to move
+            # Spray OFF (skipped when continuous -- servo held on through travel)
+            if not continuous_spray:
+                f.write("M280 P0 S0\n")
+                f.write("G4 P250\n")  #Dwell 250ms for servo to move
 
             # # used for servo jitter to prevent clogging
             # step_size = 5.0 #5 mm
@@ -511,9 +527,10 @@ def write_gcode(filename, paths):
                 E+=1
                 f.write(f"G1 X{x:.2f} Y{y:.2f} E{E} F{FEEDRATE}\n")
 
-            # Spray ON
-            f.write(f"M280 P0 S{servo_angle}\n")
-            f.write("G4 P250\n")  #Dwell 250ms for servo to move
+            # Spray ON (skipped when continuous -- servo already on from path start)
+            if not continuous_spray:
+                f.write(f"M280 P0 S{servo_angle}\n")
+                f.write("G4 P250\n")  #Dwell 250ms for servo to move
             
         f.write("M280 P0 S0\n")
         f.write("G4 P250\n")  #Dwell 250ms for servo to move
@@ -1353,6 +1370,20 @@ ctk.CTkButton(feedrate_frame, width=45, text="Set Feedrate", command=setFeedrate
 # heightEntry.grid(row=0, column=1)
 # # tk.Button(control_frame, text="Move servo", command=move_servo).grid(row=10, column=0)
 # ###### HEIGHT SELECTION #######
+
+###### CONTINUOUS SPRAY TOGGLE #######
+continuous_spray_var = tk.BooleanVar(value=False)
+continuous_frame = ctk.CTkFrame(extra_tab, fg_color="transparent")
+continuous_frame.grid(row=4, column=0, columnspan=2, padx=(5, 0), pady=(15, 0), sticky="ew")
+continuous_spray_checkbox = ctk.CTkCheckBox(
+    continuous_frame,
+    text="Continuous Spray",
+    variable=continuous_spray_var,
+    onvalue=True,
+    offvalue=False,
+)
+continuous_spray_checkbox.grid(row=0, column=0, padx=(5, 0), pady=(0, 0), sticky="w")
+###### CONTINUOUS SPRAY TOGGLE #######
 
 generate_button = ctk.CTkButton(root, text="Generate!", command=finish)
 generate_button.grid(row=1, column=0, pady=(0, 10))
