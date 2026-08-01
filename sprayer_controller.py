@@ -696,6 +696,7 @@ def move_servo():  #updated marlin function
 # PRINTER LINK (OctoPrint push socket) + JOG
 # =========================
 _POS_RE = re.compile(r"X:(-?\d+(?:\.\d+)?)\s+Y:(-?\d+(?:\.\d+)?)\s+Z:(-?\d+(?:\.\d+)?)")
+_MARKER_M280_RE = re.compile(r"M280 P0 S(\d+)")
 
 
 class PrinterLink:
@@ -713,6 +714,9 @@ class PrinterLink:
         self._lock = threading.Lock()
         self._flags = {}
         self._pos = None          # (x, y, z) or None when unknown
+        self._pos_time = 0.0      # when _pos last updated (from an M114 reply)
+        self._spraying = False    # last M280 servo command: angle>0 => spraying
+        self._progress = None     # job completion fraction (0..1) or None
         self._socket_up = False
         self._last_frame = 0.0
         self._stop = threading.Event()
@@ -730,7 +734,9 @@ class PrinterLink:
     def snapshot(self):
         with self._lock:
             return {"socket": self._socket_up, "flags": dict(self._flags),
-                    "pos": self._pos, "age": time.time() - self._last_frame}
+                    "pos": self._pos, "age": time.time() - self._last_frame,
+                    "pos_age": time.time() - self._pos_time,
+                    "spraying": self._spraying, "progress": self._progress}
 
     # State predicates evaluated from a SINGLE snapshot (no torn reads). A stale
     # socket (no push frame within STALE_S seconds) is treated as not-operational
@@ -816,14 +822,21 @@ class PrinterLink:
                 if not cur:
                     continue
                 fl = cur.get("state", {}).get("flags")
+                prog = (cur.get("progress") or {}).get("completion")
                 with self._lock:
                     self._last_frame = time.time()
                     if fl:
                         self._flags = fl
+                    if prog is not None:
+                        self._progress = prog / 100.0
                     for ln in cur.get("logs", []) or []:
+                        sm = _MARKER_M280_RE.search(ln)
+                        if sm:
+                            self._spraying = int(sm.group(1)) > 0
                         m = _POS_RE.search(ln)
                         if m:
                             self._pos = (float(m.group(1)), float(m.group(2)), float(m.group(3)))
+                            self._pos_time = time.time()
         finally:
             try:
                 ws.close()
@@ -925,6 +938,105 @@ def _do_home(axes):
             logger.error(f"Home failed: {r.status_code} - {r.text}")
     except Exception as e:
         logger.error(f"Home send failed: {e}")
+
+# =========================
+# LIVE AIRBRUSH MARKER (canvas)
+# =========================
+def machine_to_canvas(mx, my):
+    """Map machine (mm) X/Y to canvas pixels using the SAME transform the shape
+    drawing established: the shape's machine bbox (shape_original_coords) maps to
+    its drawn canvas bbox (canvas.coords(shape_to_draw))."""
+    if shape_to_draw is None:
+        return None
+    try:
+        mx0, my0, mx1, my1 = shape_original_coords
+        cx0, cy0, cx1, cy1 = canvas.coords(shape_to_draw)
+    except Exception:
+        return None
+    if mx1 == mx0 or my1 == my0:
+        return None
+    return (cx0 + (mx - mx0) * (cx1 - cx0) / (mx1 - mx0),
+            cy0 + (my - my0) * (cy1 - cy0) / (my1 - my0))
+
+
+def _flatten_path(paths):
+    pts = []
+    for seg in paths or []:
+        if seg == "DWELL":
+            continue
+        for p in seg:
+            pts.append((float(p[0]), float(p[1])))
+    return pts
+
+
+def _interp_along(pts, frac):
+    """Point at `frac` (0..1) of the arc length along the flattened toolpath."""
+    if not pts:
+        return None
+    if len(pts) == 1:
+        return pts[0]
+    d = [0.0]
+    for i in range(1, len(pts)):
+        d.append(d[-1] + math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]))
+    total = d[-1]
+    if total <= 0:
+        return pts[0]
+    target = max(0.0, min(1.0, frac)) * total
+    for i in range(1, len(pts)):
+        if d[i] >= target:
+            seg = d[i] - d[i - 1]
+            t = 0.0 if seg == 0 else (target - d[i - 1]) / seg
+            return (pts[i - 1][0] + t * (pts[i][0] - pts[i - 1][0]),
+                    pts[i - 1][1] + t * (pts[i][1] - pts[i - 1][1]))
+    return pts[-1]
+
+
+def compute_marker():
+    """State for the airbrush marker: {machine, canvas, spraying, estimated}.
+    Idle -> reported M114 position (solid). During a job -> interpolate along the
+    generated path by file-progress (estimated/hollow) and snap to a real M114
+    position whenever a fresh one arrives (solid)."""
+    s = _plink.snapshot()
+    spraying = bool(s.get("spraying"))
+    printing = bool(s["flags"].get("printing"))
+    pos = s.get("pos")
+    pos_fresh = s.get("pos_age", 1e9) < 1.5   # a real position line just arrived -> snap
+    if printing and not pos_fresh and s.get("progress") is not None:
+        mp = _interp_along(_flatten_path(globals().get("original_paths") or []), s["progress"])
+        if mp is not None:
+            return {"machine": mp, "canvas": machine_to_canvas(*mp),
+                    "spraying": spraying, "estimated": True}
+    if pos is not None:
+        return {"machine": (pos[0], pos[1]), "canvas": machine_to_canvas(pos[0], pos[1]),
+                "spraying": spraying, "estimated": False}
+    return {"machine": None, "canvas": None, "spraying": spraying, "estimated": False}
+
+
+def draw_marker(m):
+    canvas.delete("airbrush_marker")
+    if not m or m.get("canvas") is None:
+        return
+    cx, cy = m["canvas"]
+    color = "#ff3d3d" if m["spraying"] else "#4a6572"   # red = spraying, slate = off
+    r = 7
+    canvas.create_line(cx - r - 5, cy, cx + r + 5, cy, fill=color, width=2, tags="airbrush_marker")
+    canvas.create_line(cx, cy - r - 5, cx, cy + r + 5, fill=color, width=2, tags="airbrush_marker")
+    if m["estimated"]:   # hollow ring = estimated (job interpolation)
+        canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline=color, width=2, tags="airbrush_marker")
+    else:                # solid dot = reported (M114)
+        canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=color, outline=color, tags="airbrush_marker")
+
+
+def update_marker():
+    try:
+        draw_marker(compute_marker())
+    except Exception:
+        pass
+    try:
+        root.after(200, update_marker)
+    except Exception:
+        pass
+
 
 def is_integer(s):
     try:
@@ -1666,6 +1778,7 @@ _jog_widgets = [home_xy_button, home_all_button, xbutton_left, xbutton_right,
 
 _plink.start()            # begin the OctoPrint push-socket link
 update_gui_coordinates()  # start readout + gating loop
+update_marker()           # start the live airbrush marker on the canvas
 ##### Jog Panel #######
 
 if __name__ == "__main__":
