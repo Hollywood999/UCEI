@@ -11,6 +11,11 @@ import subprocess
 import numpy as np
 import serial
 import time
+import json
+import re
+import threading
+import queue
+import websocket
 from shapely.geometry import Polygon, LineString, Point
 from shapely.affinity import rotate, translate
 
@@ -49,19 +54,49 @@ from config import (ARDUINO_PORT, OCTOPRINT_PORT, OCTOPRINT_URL, API_KEY,
                     ALLOW_STARTUP_MOTION, CONFIRM_MOTION, TARGET)
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
 logger = logging.getLogger()
+# Keep third-party HTTP/socket debug chatter (urllib3, websocket) out of the
+# GUI log box and console -- PrinterLink polls M114 frequently.
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("websocket").setLevel(logging.WARNING)
 
 class TextLogHandler(logging.Handler):
-    """Custom logging handler that writes log messages into a Tkinter Text widget"""
+    """Logging handler that writes into a Tkinter Text widget.
+
+    Tk is not thread-safe, so emit() (which may be called from background
+    threads such as PrinterLink, including via urllib3's logging) only
+    enqueues text; a periodic main-thread drain updates the widget.
+    """
     def __init__(self, text_widget):
         super().__init__()
         self.text_widget = text_widget
+        self._queue = queue.Queue()
+        try:
+            self.text_widget.after(200, self._drain)
+        except Exception:
+            pass
 
     def emit(self, record):
-        msg = self.format(record)
-        self.text_widget.config(state="normal")
-        self.text_widget.insert("end", msg + "\n")
-        self.text_widget.see("end")
-        self.text_widget.config(state="disabled")
+        try:
+            self._queue.put_nowait(self.format(record))
+        except Exception:
+            pass
+
+    def _drain(self):
+        try:
+            while True:
+                msg = self._queue.get_nowait()
+                self.text_widget.config(state="normal")
+                self.text_widget.insert("end", msg + "\n")
+                self.text_widget.see("end")
+                self.text_widget.config(state="disabled")
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+        try:
+            self.text_widget.after(200, self._drain)
+        except Exception:
+            pass
 
 # =========================
 # PATH GENERATORS
@@ -657,52 +692,239 @@ def move_servo():  #updated marlin function
         return
     return
 
+# =========================
+# PRINTER LINK (OctoPrint push socket) + JOG
+# =========================
+_POS_RE = re.compile(r"X:(-?\d+(?:\.\d+)?)\s+Y:(-?\d+(?:\.\d+)?)\s+Z:(-?\d+(?:\.\d+)?)")
+
+
+class PrinterLink:
+    """Background OctoPrint push-socket client.
+
+    Tracks live printer state flags and the reported X/Y/Z position (parsed
+    from M114 replies in the terminal stream). Injects M114 on a throttle --
+    every ~2s while idle, at most every 5s during a job so it never stalls a
+    running print. GUI reads go through snapshot()/can_jog(); it never touches
+    Tk widgets (Tk is updated only from the main thread in update_gui_coordinates).
+    """
+    def __init__(self, base_url, api_key):
+        self._base = base_url.rstrip("/")
+        self._key = api_key
+        self._lock = threading.Lock()
+        self._flags = {}
+        self._pos = None          # (x, y, z) or None when unknown
+        self._socket_up = False
+        self._last_frame = 0.0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="PrinterLink", daemon=True)
+        self._started = False
+
+    def start(self):
+        if not self._started:
+            self._started = True
+            self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def snapshot(self):
+        with self._lock:
+            return {"socket": self._socket_up, "flags": dict(self._flags),
+                    "pos": self._pos, "age": time.time() - self._last_frame}
+
+    # State predicates evaluated from a SINGLE snapshot (no torn reads). A stale
+    # socket (no push frame within STALE_S seconds) is treated as not-operational
+    # so the guard never trusts a half-open connection.
+    STALE_S = 8.0
+
+    @classmethod
+    def _operational(cls, s):
+        return bool(s["socket"] and s["flags"].get("operational")
+                    and not s["flags"].get("closedOrError") and s["age"] < cls.STALE_S)
+
+    @staticmethod
+    def _busy(s):
+        f = s["flags"]
+        return bool(f.get("printing") or f.get("paused") or f.get("pausing")
+                    or f.get("cancelling") or f.get("resuming") or f.get("finishing"))
+
+    def is_operational(self):
+        return self._operational(self.snapshot())
+
+    def is_busy(self):
+        return self._busy(self.snapshot())
+
+    def can_jog(self):
+        # jog only when a FRESH socket says operational and not mid-job (single snapshot)
+        s = self.snapshot()
+        return bool(self._operational(s) and not self._busy(s))
+
+    def _headers(self):
+        return {"X-Api-Key": self._key, "Content-Type": "application/json"}
+
+    def _send_m114(self):
+        try:
+            requests.post(self._base + "/api/printer/command",
+                          headers=self._headers(), json={"command": "M114"}, timeout=4)
+        except Exception:
+            pass
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                self._session()
+            except Exception as e:
+                logger.debug(f"PrinterLink session ended: {e}")
+            with self._lock:
+                self._socket_up = False
+                self._pos = None
+                self._flags = {}
+            self._stop.wait(3.0)   # backoff before reconnect
+
+    def _session(self):
+        r = requests.post(self._base + "/api/login", headers=self._headers(),
+                          json={"passive": True}, timeout=6)
+        j = r.json()
+        name, session = j.get("name"), j.get("session")
+        if not (name and session):
+            raise RuntimeError("no push-socket session from /api/login")
+        ws = websocket.create_connection(
+            self._base.replace("http", "ws") + "/sockjs/websocket", timeout=1.5)
+        try:
+            ws.send(json.dumps({"auth": f"{name}:{session}"}))
+            with self._lock:
+                self._socket_up = True
+            last_m114 = 0.0
+            while not self._stop.is_set():
+                now = time.time()
+                if self.is_operational():
+                    interval = 5.0 if self.is_busy() else 2.0
+                    if now - last_m114 >= interval:
+                        self._send_m114()
+                        last_m114 = now
+                try:
+                    frame = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                if not frame:
+                    continue
+                try:
+                    msg = json.loads(frame)
+                except Exception:
+                    continue
+                cur = msg.get("current")
+                if not cur:
+                    continue
+                fl = cur.get("state", {}).get("flags")
+                with self._lock:
+                    self._last_frame = time.time()
+                    if fl:
+                        self._flags = fl
+                    for ln in cur.get("logs", []) or []:
+                        m = _POS_RE.search(ln)
+                        if m:
+                            self._pos = (float(m.group(1)), float(m.group(2)), float(m.group(3)))
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
+_plink = PrinterLink(OCTOPRINT_URL, API_KEY)
+
+
 def update_gui_coordinates():
-    # print(x_coord_str)
-    x_coord_str.set(f"X: {CURRENT_X:.1f} mm")
-    y_coord_str.set(f"Y: {CURRENT_Y:.1f} mm")
-    z_coord_str.set(f"Z: {CURRENT_Z:.1f} mm")
-    
-    # Refresh every 250 milliseconds
-    root.after(500, update_gui_coordinates)
-
-def jog_machine(event):
-    global CURRENT_X, CURRENT_Y, CURRENT_Z
-    displacement = jog_option.get()
-    logger.debug(f"User clicked {displacement} and {event}")
-    if not _motion_allowed(f"Jog {event} by {displacement}"):
-        return
-    commands = []
-    headers = {
-            "X-Api-Key": API_KEY,
-            "Content-Type": "application/json"
-        }
-    if event=="MOVE":
-        commands = [f"G0 X{CURRENT_X} Y{CURRENT_Y}"]
-    elif event=="HOME":
-        commands = [f"G10 L2 P1 X{CURRENT_X} Y{CURRENT_Y}", "G54"]
-    elif event[-1] == "-":
-        commands=["G21", "G91", f"G0 {event}{displacement[:-2]}", "G90"]
-        if event[0]=="X": CURRENT_X -= float(displacement[:-2])
-        elif event[0]=="Z": CURRENT_Z -= float(displacement[:-2])
-        else: CURRENT_Y -= float(displacement[:-2])
+    # Socket-driven position readout + jog-control gating (replaces the old
+    # dead-reckoning). Runs on the Tk main thread via root.after.
+    s = _plink.snapshot()
+    operational = PrinterLink._operational(s)
+    if s["pos"] is not None and operational:
+        x, y, z = s["pos"]
+        x_coord_str.set(f"X: {x:.1f} mm")
+        y_coord_str.set(f"Y: {y:.1f} mm")
+        z_coord_str.set(f"Z: {z:.1f} mm")
     else:
-        commands=["G21", "G91", f"G0 {event[:-1]}{displacement[:-2]}", "G90"]
-        if event[0]=="X": CURRENT_X += float(displacement[:-2])
-        elif event[0]=="Z": CURRENT_Z += float(displacement[:-2])
-        else: CURRENT_Y += float(displacement[:-2])
-
-    print(CURRENT_X, CURRENT_Y)
-    payload = {"commands": commands}
-
+        x_coord_str.set("X: —")
+        y_coord_str.set("Y: —")
+        z_coord_str.set("Z: —")
+    new_state = "normal" if (operational and not PrinterLink._busy(s)) else "disabled"
+    for w in _jog_widgets:
+        try:
+            w.configure(state=new_state)
+        except Exception:
+            pass
     try:
-        response = requests.post(f"{OCTOPRINT_URL}api/printer/command", headers=headers, json=payload)
-        if response.status_code == 204:
-            logger.info("Successfully sent jog command to OctoPrint!")
-        else:
-            logger.error(f"Error: {response.status_code} - {response.text}")
+        root.after(500, update_gui_coordinates)
+    except Exception:
+        pass
+
+
+def _get_jog_feedrate():
+    try:
+        v = float(jog_feedrate_entry.get())
+        if math.isfinite(v) and v > 0:
+            return v
+    except Exception:
+        pass
+    return 1500.0  # default mm/min
+
+
+def _jog_step():
+    # step selector values look like "0.1 mm" / "1 mm" / "10 mm"
+    try:
+        return float(jog_step_option.get().split()[0])
+    except Exception:
+        return 1.0
+
+
+def _do_jog(dx=0.0, dy=0.0, dz=0.0):
+    if not _plink.can_jog():
+        logger.info("Jog ignored: printer not connected/operational or busy.")
+        return
+    step = _jog_step()
+    fr = _get_jog_feedrate()
+    move = {}
+    if dx:
+        move["x"] = dx * step
+    if dy:
+        move["y"] = dy * step
+    if dz:
+        move["z"] = dz * step
+    if not move:
+        return
+    if not _motion_allowed(f"Jog {move} at {fr:.0f} mm/min"):
+        return
+    if not _plink.can_jog():  # re-check: state may have changed during confirmation
+        logger.info("Jog aborted: printer no longer connected/idle after confirmation.")
+        return
+    try:
+        r = requests.post(f"{OCTOPRINT_URL}api/printer/printhead",
+                          headers={"X-Api-Key": API_KEY, "Content-Type": "application/json"},
+                          json={"command": "jog", "speed": fr, "absolute": False, **move}, timeout=6)
+        if r.status_code not in (200, 204):
+            logger.error(f"Jog failed: {r.status_code} - {r.text}")
     except Exception as e:
-        logger.error(f"Failed to connect to OctoPrint / move machine: {e}")
+        logger.error(f"Jog send failed: {e}")
+
+
+def _do_home(axes):
+    if not _plink.can_jog():
+        logger.info("Home ignored: printer not connected/operational or busy.")
+        return
+    if not _motion_allowed(f"Home {'/'.join(axes).upper()}"):
+        return
+    if not _plink.can_jog():  # re-check: state may have changed during confirmation
+        logger.info("Home aborted: printer no longer connected/idle after confirmation.")
+        return
+    try:
+        r = requests.post(f"{OCTOPRINT_URL}api/printer/printhead",
+                          headers={"X-Api-Key": API_KEY, "Content-Type": "application/json"},
+                          json={"command": "home", "axes": axes}, timeout=6)
+        if r.status_code not in (200, 204):
+            logger.error(f"Home failed: {r.status_code} - {r.text}")
+    except Exception as e:
+        logger.error(f"Home send failed: {e}")
 
 def is_integer(s):
     try:
@@ -1381,68 +1603,69 @@ canvas.grid(row = 0, column=1) # Put the Canvas in row 0, col 0
 # #####
 
 ##### Jog Panel #######
-jog_panel = ctk.CTkFrame(root, fg_color="transparent", width=270)
+jog_panel = ctk.CTkFrame(root, fg_color="transparent", width=290)
 jog_panel.grid_propagate(False)
-jog_panel.grid(row=0, column=2, padx=(20, 20), pady=(30, 0), sticky="nswe")
+jog_panel.grid(row=0, column=2, padx=(20, 20), pady=(20, 0), sticky="nswe")
+for _c in range(3):
+    jog_panel.grid_columnconfigure(_c, weight=1)
 
-jog_panel.grid_columnconfigure(0, weight=1)
-jog_panel.grid_columnconfigure(1, weight=1)
-jog_panel.grid_columnconfigure(2, weight=1)
+# --- Home row ---
+home_xy_button = ctk.CTkButton(jog_panel, text="Home XY", width=80, height=28,
+                               command=lambda: _do_home(["x", "y"]))
+home_xy_button.grid(row=0, column=0, columnspan=2, pady=(6, 6), padx=2, sticky="ew")
+home_all_button = ctk.CTkButton(jog_panel, text="Home All", width=80, height=28,
+                                command=lambda: _do_home(["x", "y", "z"]))
+home_all_button.grid(row=0, column=2, pady=(6, 6), padx=2, sticky="ew")
 
-jog_panel.grid_rowconfigure(0, weight=1)  # Top buffer spring
-jog_panel.grid_rowconfigure(5, weight=1)  # Bottom buffer spring
+# --- XY pad (cols 0-2) + Z column (col 3) ---
+ybutton_top = ctk.CTkButton(jog_panel, text="▲", width=46, height=40, command=lambda: _do_jog(dy=+1))
+ybutton_top.grid(row=1, column=1, pady=(4, 2))
+xbutton_left = ctk.CTkButton(jog_panel, text="◀", width=46, height=40, command=lambda: _do_jog(dx=-1))
+xbutton_left.grid(row=2, column=0)
+xbutton_right = ctk.CTkButton(jog_panel, text="▶", width=46, height=40, command=lambda: _do_jog(dx=+1))
+xbutton_right.grid(row=2, column=2)
+ybutton_bottom = ctk.CTkButton(jog_panel, text="▼", width=46, height=40, command=lambda: _do_jog(dy=-1))
+ybutton_bottom.grid(row=3, column=1, pady=(2, 4))
 
-# jogpanel_label = ctk.CTkLabel(jog_panel, font=ctk.CTkFont(size=15, weight="bold"), text="Work Home Coordinates:")
-# jogpanel_label.grid(row=0, columnspan=3, column=0)
+zbutton_top = ctk.CTkButton(jog_panel, text="Z ▲", width=46, height=34, command=lambda: _do_jog(dz=+1))
+zbutton_top.grid(row=1, column=3, padx=(10, 0), pady=(4, 2))
+zbutton_bottom = ctk.CTkButton(jog_panel, text="Z ▼", width=46, height=34, command=lambda: _do_jog(dz=-1))
+zbutton_bottom.grid(row=3, column=3, padx=(10, 0), pady=(2, 4))
 
-workhome_move = ctk.CTkButton(jog_panel, text="Current Work Home", width=30, height=30, command=lambda: jog_machine("MOVE"))
-workhome_move.grid(row=0, column=0, columnspan=3, pady=(20), padx=(0, 0))
+# --- Step selector (0.1 / 1 / 10 mm) ---
+jog_step_var = ctk.StringVar(value="1 mm")
+jog_step_option = ctk.CTkSegmentedButton(jog_panel, values=["0.1 mm", "1 mm", "10 mm"],
+                                         variable=jog_step_var, dynamic_resizing=False, height=28)
+jog_step_option.grid(row=4, column=0, columnspan=4, pady=(10, 4), padx=2, sticky="ew")
 
-xbutton_left = ctk.CTkButton(jog_panel, text="◀", width=40, height=40, command=lambda: jog_machine("X-"))
-xbutton_left.grid(row=2, column=0, pady=(20), sticky="ns")
-xbutton_right = ctk.CTkButton(jog_panel, text="▶", width=40, height=40, command=lambda: jog_machine("X+"))
-xbutton_right.grid(row=2, column=2, pady=(20))
+# --- Jog feedrate ---
+feed_row = ctk.CTkFrame(jog_panel, fg_color="transparent")
+feed_row.grid(row=5, column=0, columnspan=4, pady=(2, 4), padx=2, sticky="w")
+ctk.CTkLabel(feed_row, text="Jog feedrate (mm/min):").grid(row=0, column=0, padx=(0, 6))
+jog_feedrate_entry = ctk.CTkEntry(feed_row, width=70)
+jog_feedrate_entry.insert(0, "1500")
+jog_feedrate_entry.grid(row=0, column=1)
 
-ybutton_top = ctk.CTkButton(jog_panel, text="▲", width=40, height=40, command=lambda: jog_machine("Y+"))
-ybutton_top.grid(row=1, column=1, padx=(20), pady=(0, 0))
-ybutton_bottom = ctk.CTkButton(jog_panel, text="▼", width=40, height=40, command=lambda: jog_machine("Y-"))
-ybutton_bottom.grid(row=3, column=1, padx=(20), pady=(0, 0))
+# --- Position readout (from M114 via the push socket; "—" when unknown) ---
+x_coord_str = ctk.StringVar(value="X: —")
+y_coord_str = ctk.StringVar(value="Y: —")
+z_coord_str = ctk.StringVar(value="Z: —")
+readout = ctk.CTkFrame(jog_panel, fg_color="transparent")
+readout.grid(row=6, column=0, columnspan=4, pady=(6, 2))
+ctk.CTkLabel(readout, textvariable=x_coord_str, font=ctk.CTkFont(size=14, weight="bold"), text_color="#3b8ed0").grid(row=0, column=0, padx=6)
+ctk.CTkLabel(readout, textvariable=y_coord_str, font=ctk.CTkFont(size=14, weight="bold"), text_color="#3b8ed0").grid(row=0, column=1, padx=6)
+ctk.CTkLabel(readout, textvariable=z_coord_str, font=ctk.CTkFont(size=14, weight="bold"), text_color="#3b8ed0").grid(row=0, column=2, padx=6)
 
-zbutton_top = ctk.CTkButton(jog_panel, text="▲", width=40, height=40, command=lambda: jog_machine("Z+"))
-zbutton_top.grid(row=1, column=3, padx=(35, 0), pady=(0, 0))
-zbutton_bottom = ctk.CTkButton(jog_panel, text="▼", width=40, height=40, command=lambda: jog_machine("Z-"))
-zbutton_bottom.grid(row=3, column=3, padx=(35, 0), pady=(0, 0))
+panel_note = ctk.CTkLabel(jog_panel, text="Jog via OctoPrint printhead API; greys out when busy/offline")
+panel_note.grid(row=7, column=0, columnspan=4, pady=(4, 0))
 
-workhome_button = ctk.CTkButton(jog_panel, font=("Lexend", 25), text="⌂", width=50, height=50, command=lambda: jog_machine("HOME"))
-workhome_button.grid(row=2, column=1, pady=(0, 0))
+# Widgets greyed out unless Operational & idle (managed in update_gui_coordinates)
+_jog_widgets = [home_xy_button, home_all_button, xbutton_left, xbutton_right,
+                ybutton_top, ybutton_bottom, zbutton_top, zbutton_bottom,
+                jog_step_option, jog_feedrate_entry]
 
-button_var = ctk.StringVar(value="1mm")
-jog_option = ctk.CTkSegmentedButton(
-    jog_panel, 
-    values=["1mm", "10mm", "100mm"],
-    variable=button_var,
-    dynamic_resizing=False,
-    width=170,
-    height=30
-)
-jog_option.grid(row=4, column=0, columnspan=3, padx=(10, 0), pady=(20, 0), sticky="w")
-
-x_coord_str = ctk.StringVar(value="X: 0.0 mm")
-y_coord_str = ctk.StringVar(value="Y: 0.0 mm")
-z_coord_str = ctk.StringVar(value="Z: 0.0 mm")
-
-x_display = ctk.CTkLabel(jog_panel, textvariable=x_coord_str, font=ctk.CTkFont(size=14, weight="bold"), text_color="#3b8ed0")
-x_display.grid(row=5, column=0, columnspan=2, padx=(0, 40))
-
-y_display = ctk.CTkLabel(jog_panel, textvariable=y_coord_str, font=ctk.CTkFont(size=14, weight="bold"), text_color="#3b8ed0")
-y_display.grid(row=5, column=1, columnspan=2, padx=(30,0))
-
-z_display = ctk.CTkLabel(jog_panel, textvariable=z_coord_str, font=ctk.CTkFont(size=14, weight="bold"), text_color="#3b8ed0")
-z_display.grid(row=5, column=2, columnspan=2, padx=(30,0))
-update_gui_coordinates()
-
-panel_note = ctk.CTkLabel(jog_panel, text="Click ⌂ to set the work home!")
-panel_note.grid(row=6, columnspan=3, column=0, pady=(5, 0))
+_plink.start()            # begin the OctoPrint push-socket link
+update_gui_coordinates()  # start readout + gating loop
 ##### Jog Panel #######
 
 if __name__ == "__main__":

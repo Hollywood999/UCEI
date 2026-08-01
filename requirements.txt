@@ -3,3 +3,4 @@ pyserial
 requests
 shapely
 customtkinter
+websocket-client
