@@ -45,7 +45,8 @@ shape_to_draw = None
 # config.py and are selected by the UCEI_TARGET env var (default LOCAL, or PI).
 # For LOCAL the API key is read from config_local.py (git-ignored) so keys are
 # never committed.
-from config import ARDUINO_PORT, OCTOPRINT_PORT, OCTOPRINT_URL, API_KEY
+from config import (ARDUINO_PORT, OCTOPRINT_PORT, OCTOPRINT_URL, API_KEY,
+                    ALLOW_STARTUP_MOTION, CONFIRM_MOTION, TARGET)
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
 logger = logging.getLogger()
 
@@ -597,6 +598,26 @@ def default_rect_path_generator():
 ##########################
 # HELPER FUNCTIONS
 ##########################
+def _motion_allowed(action_desc):
+    """Safety gate for interactive motion/actuation commands.
+
+    Returns True if the command may be sent to the printer. In profiles that
+    require confirmation (CONFIRM_MOTION, e.g. PI / real hardware) the operator
+    is prompted first and False is returned if they decline.
+    """
+    if not CONFIRM_MOTION:
+        return True
+    allowed = mb.askyesno(
+        f"Confirm motion  [{TARGET}]",
+        f"Send this command to the REAL machine?\n\n{action_desc}\n\n"
+        "Make sure the work area is clear before proceeding.",
+        icon="warning",
+    )
+    if not allowed:
+        logger.warning(f"[{TARGET}] Motion command cancelled by operator: {action_desc}")
+    return allowed
+
+
 def move_servo():  #updated marlin function
     global ser
     angle = servoDegreetb.get()
@@ -613,6 +634,8 @@ def move_servo():  #updated marlin function
             "Content-Type": "application/json"
         }
         
+        if not _motion_allowed(f"Move servo to {new_angle} deg  (M280 P0 S{new_angle})"):
+            return
         commands = [f"M280 P0 S{new_angle}","G4 S3", "M280 P0 S0"]
         
         payload = {"commands": commands}
@@ -647,6 +670,8 @@ def jog_machine(event):
     global CURRENT_X, CURRENT_Y, CURRENT_Z
     displacement = jog_option.get()
     logger.debug(f"User clicked {displacement} and {event}")
+    if not _motion_allowed(f"Jog {event} by {displacement}"):
+        return
     commands = []
     headers = {
             "X-Api-Key": API_KEY,
@@ -1040,15 +1065,21 @@ def background_setup(): # connects to arduino and connects printer to octoprint
         logger.error(f"Failed to connect to OctoPrint/printer: {e}")
 
 
-    payload = {"commands": ["G28 X Y"]}
-    try:
-        response = requests.post(f"{OCTOPRINT_URL}api/printer/command", headers=headers, json=payload)
-        if response.status_code == 204:
-            logger.info("Successfully sent jog command to OctoPrint!")
-        else:
-            logger.error(f"Error: {response.status_code} - {response.text}")
-    except Exception as e:
-        logger.error(f"Failed to connect to OctoPrint / move machine: {e}")
+    # Safety gate: only home (G28) on startup when the active profile allows it.
+    # PI (real hardware) sets allow_startup_motion=False so nothing moves on launch.
+    if not ALLOW_STARTUP_MOTION:
+        logger.warning(f"[{TARGET}] Startup motion disabled (allow_startup_motion=False); "
+                       "skipping G28 homing on startup.")
+    else:
+        payload = {"commands": ["G28 X Y"]}
+        try:
+            response = requests.post(f"{OCTOPRINT_URL}api/printer/command", headers=headers, json=payload)
+            if response.status_code == 204:
+                logger.info("Successfully sent jog command to OctoPrint!")
+            else:
+                logger.error(f"Error: {response.status_code} - {response.text}")
+        except Exception as e:
+            logger.error(f"Failed to connect to OctoPrint / move machine: {e}")
 
     
     # update_gui_coordinates()

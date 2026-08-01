@@ -20,6 +20,10 @@ _TARGET = os.environ.get("UCEI_TARGET", "LOCAL").strip().upper()
 if _TARGET == "LOCAL":
     OCTOPRINT_URL = f"http://127.0.0.1:{OCTOPRINT_PORT}/"
     ARDUINO_PORT = "COM3"
+    # Local virtual/dev printer: homing on startup is safe, and interactive
+    # motion needs no per-command confirmation.
+    ALLOW_STARTUP_MOTION = True
+    CONFIRM_MOTION = False
     try:
         from config_local import API_KEY
     except ImportError as exc:
@@ -34,6 +38,13 @@ elif _TARGET == "PI":
     # This key belongs to the Pi's OctoPrint instance (private LAN).
     API_KEY = "ErDYaK23QBxF7Ka27f9zHV2sTz8MAHNWF76mROEJiuw"
     ARDUINO_PORT = None
+    # Real hardware attached: never move on startup, and require an explicit
+    # operator confirmation before any interactive motion command is sent.
+    ALLOW_STARTUP_MOTION = False
+    CONFIRM_MOTION = True
 
 else:
     raise ValueError(f"Unknown UCEI_TARGET {_TARGET!r}; expected 'LOCAL' or 'PI'.")
+
+# Resolved active profile name (used for logging and motion-confirmation dialogs).
+TARGET = _TARGET
