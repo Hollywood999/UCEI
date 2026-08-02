@@ -3,6 +3,7 @@ import customtkinter as ctk
 from tkinter import ttk
 from tkinter import messagebox as mb
 import sys
+import os
 import math
 import logging
 import webbrowser
@@ -46,12 +47,74 @@ CURRENT_X = 0.0
 CURRENT_Y = 0.0
 CURRENT_Z = 0.0
 shape_to_draw = None
-# Connection settings (Arduino port, OctoPrint URL/port, API key) live in
-# config.py and are selected by the UCEI_TARGET env var (default LOCAL, or PI).
-# For LOCAL the API key is read from config_local.py (git-ignored) so keys are
-# never committed.
-from config import (ARDUINO_PORT, OCTOPRINT_PORT, OCTOPRINT_URL, API_KEY,
-                    ALLOW_STARTUP_MOTION, CONFIRM_MOTION, TARGET)
+# =========================
+# CONNECTION CONFIG + MODE  (single file; original defaults, optional override)
+# =========================
+# Built-in defaults match the original repo, so a bare copy on the Pi behaves
+# exactly as before. An optional ucei_local.json next to this script (Windows /
+# remote use) overrides these; a missing or malformed file is ignored.
+OCTOPRINT_PORT = 5001
+OCTOPRINT_URL = f"http://127.0.0.1:{OCTOPRINT_PORT}/"     # original default (Pi-local OctoPrint)
+API_KEY = "ErDYaK23QBxF7Ka27f9zHV2sTz8MAHNWF76mROEJiuw"   # original repo key (Pi's OctoPrint)
+ARDUINO_PORT = "/dev/ttyACM0"                            # original default
+
+
+def _load_local_config():
+    global OCTOPRINT_URL, API_KEY, ARDUINO_PORT
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ucei_local.json")
+        with open(path) as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            return
+        host = cfg.get("remote_host")
+        if host:
+            host = str(host)
+            OCTOPRINT_URL = host if "://" in host else f"http://{host}:{OCTOPRINT_PORT}/"
+            if not OCTOPRINT_URL.endswith("/"):
+                OCTOPRINT_URL += "/"
+        if cfg.get("api_key"):
+            API_KEY = str(cfg["api_key"])
+        if cfg.get("com_port"):
+            ARDUINO_PORT = str(cfg["com_port"])
+    except Exception:
+        pass  # missing or malformed -> keep defaults, never crash
+
+
+_load_local_config()
+
+
+def _host_of(url):
+    m = re.search(r"://([^:/]+)", url or "")
+    return (m.group(1) if m else "127.0.0.1").lower()
+
+
+def _compute_mode(platform_name, url):
+    """Deployment mode from (platform, OctoPrint URL) -- testable in isolation.
+    real_hardware: a printer physically on this box (Linux/Pi) OR a remote OctoPrint.
+    startup_homing: the original startup G28 runs only for a loopback host."""
+    loopback = _host_of(url) in ("127.0.0.1", "localhost", "::1")
+    return {"loopback": loopback,
+            "real_hardware": platform_name.startswith("linux") or not loopback,
+            "startup_homing": loopback}
+
+
+_MODE = _compute_mode(sys.platform, OCTOPRINT_URL)
+LOOPBACK = _MODE["loopback"]
+REAL_HARDWARE = _MODE["real_hardware"]
+STARTUP_HOMING = _MODE["startup_homing"]
+_FORCE_REAL_HARDWARE = False     # tests pin this
+_ARMED = False                   # session ARM state (real hardware only; dev ignores it)
+
+
+def _real_hardware():
+    return REAL_HARDWARE or _FORCE_REAL_HARDWARE
+
+
+def _motion_permitted():
+    """True if motion/actuation bytes may leave the program on ANY channel now.
+    Dev (loopback + non-Linux) is ungated; on real hardware, requires ARM MOTION."""
+    return (not _real_hardware()) or _ARMED
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
 logger = logging.getLogger()
 # Keep third-party HTTP/socket debug chatter (urllib3, websocket) out of the
@@ -633,24 +696,11 @@ def default_rect_path_generator():
 ##########################
 # HELPER FUNCTIONS
 ##########################
-def _motion_allowed(action_desc):
-    """Safety gate for interactive motion/actuation commands.
-
-    Returns True if the command may be sent to the printer. In profiles that
-    require confirmation (CONFIRM_MOTION, e.g. PI / real hardware) the operator
-    is prompted first and False is returned if they decline.
-    """
-    if not CONFIRM_MOTION:
-        return True
-    allowed = mb.askyesno(
-        f"Confirm motion  [{TARGET}]",
-        f"Send this command to the REAL machine?\n\n{action_desc}\n\n"
-        "Make sure the work area is clear before proceeding.",
-        icon="warning",
-    )
-    if not allowed:
-        logger.warning(f"[{TARGET}] Motion command cancelled by operator: {action_desc}")
-    return allowed
+def _motion_allowed(action_desc=""):
+    """Gate for interactive motion/actuation. No per-action dialog any more:
+    dev (loopback + non-Linux) is ungated; on real hardware motion is permitted
+    only while ARM MOTION is on. Arming is the consent. See _motion_permitted()."""
+    return _motion_permitted()
 
 
 def move_servo():  #updated marlin function
@@ -672,7 +722,8 @@ def move_servo():  #updated marlin function
         if not _motion_allowed(f"Move servo to {new_angle} deg  (M280 P0 S{new_angle})"):
             return
         commands = [f"M280 P0 S{new_angle}","G4 S3", "M280 P0 S0"]
-        
+        _plink.note_servo(new_angle)   # update the commanded-angle indicator immediately
+
         payload = {"commands": commands}
         
         # payload = {"command": f"M280 P0 S{new_angle}"}
@@ -715,8 +766,10 @@ class PrinterLink:
         self._flags = {}
         self._pos = None          # (x, y, z) or None when unknown
         self._pos_time = 0.0      # when _pos last updated (from an M114 reply)
-        self._spraying = False    # last M280 servo command: angle>0 => spraying
+        self._servo_angle = None  # last commanded servo angle (M280 S<n>); None until first seen
         self._progress = None     # job completion fraction (0..1) or None
+        self._job_file = None     # currently-selected job file name (for the Print button)
+        self._log_q = queue.Queue(maxsize=4000)  # comm-log lines mirrored to the terminal panel
         self._socket_up = False
         self._last_frame = 0.0
         self._stop = threading.Event()
@@ -736,7 +789,8 @@ class PrinterLink:
             return {"socket": self._socket_up, "flags": dict(self._flags),
                     "pos": self._pos, "age": time.time() - self._last_frame,
                     "pos_age": time.time() - self._pos_time,
-                    "spraying": self._spraying, "progress": self._progress}
+                    "servo_angle": self._servo_angle, "progress": self._progress,
+                    "job_file": self._job_file}
 
     # State predicates evaluated from a SINGLE snapshot (no torn reads). A stale
     # socket (no push frame within STALE_S seconds) is treated as not-operational
@@ -772,6 +826,15 @@ class PrinterLink:
         try:
             requests.post(self._base + "/api/printer/command",
                           headers=self._headers(), json={"command": "M114"}, timeout=4)
+        except Exception:
+            pass
+
+    def note_servo(self, angle):
+        """Record a servo angle the GUI itself just commanded (zero-lag update;
+        the comm-log stream will also carry it -- same field, one source of truth)."""
+        try:
+            with self._lock:
+                self._servo_angle = int(angle)
         except Exception:
             pass
 
@@ -823,16 +886,22 @@ class PrinterLink:
                     continue
                 fl = cur.get("state", {}).get("flags")
                 prog = (cur.get("progress") or {}).get("completion")
+                jobf = ((cur.get("job") or {}).get("file") or {}).get("name")
                 with self._lock:
                     self._last_frame = time.time()
                     if fl:
                         self._flags = fl
                     if prog is not None:
                         self._progress = prog / 100.0
+                    self._job_file = jobf
                     for ln in cur.get("logs", []) or []:
+                        try:
+                            self._log_q.put_nowait(ln)   # mirror the comm stream to the terminal
+                        except queue.Full:
+                            pass
                         sm = _MARKER_M280_RE.search(ln)
                         if sm:
-                            self._spraying = int(sm.group(1)) > 0
+                            self._servo_angle = int(sm.group(1))   # commanded angle (job/terminal/external)
                         m = _POS_RE.search(ln)
                         if m:
                             self._pos = (float(m.group(1)), float(m.group(2)), float(m.group(3)))
@@ -861,12 +930,45 @@ def update_gui_coordinates():
         x_coord_str.set("X: —")
         y_coord_str.set("Y: —")
         z_coord_str.set("Z: —")
-    new_state = "normal" if (operational and not PrinterLink._busy(s)) else "disabled"
+    jog_ok = operational and not PrinterLink._busy(s) and _motion_permitted()  # real hw needs ARM
+    new_state = "normal" if jog_ok else "disabled"
     for w in _jog_widgets:
         try:
             w.configure(state=new_state)
         except Exception:
             pass
+    # servo commanded-angle indicator (there is no feedback from the servo)
+    try:
+        ang = s.get("servo_angle")
+        servo_angle_str.set("Servo (commanded): %d°" % ang if ang is not None
+                            else "Servo (commanded): —")
+    except Exception:
+        pass
+    # terminal input/send are enabled only while connected
+    try:
+        term_state = "normal" if operational else "disabled"
+        terminal_input.configure(state=term_state)
+        terminal_send_button.configure(state=term_state)
+    except Exception:
+        pass
+    # machine controls: ARM toggle, one-click Print (filename/reason), Pause/Cancel
+    try:
+        arm_switch.configure(state="normal" if (operational and _real_hardware()) else "disabled")
+        jf = s.get("job_file")
+        if not operational:
+            print_button.configure(state="disabled", text="Print — connect printer")
+        elif not jf:
+            print_button.configure(state="disabled", text="Print — select a file")
+        elif _real_hardware() and not _ARMED:
+            print_button.configure(state="disabled", text="Print — ARM first")
+        else:
+            print_button.configure(state="normal",
+                                   text=("Resume: " if s["flags"].get("paused") else "Print: ") + str(jf))
+        pc = "normal" if operational else "disabled"     # Pause/Cancel always live while connected
+        pause_button.configure(state=pc)
+        cancel_button.configure(state=pc)
+    except Exception:
+        pass
     try:
         root.after(500, update_gui_coordinates)
     except Exception:
@@ -939,6 +1041,46 @@ def _do_home(axes):
     except Exception as e:
         logger.error(f"Home send failed: {e}")
 
+
+def _post_job(body):
+    if not _plink.is_operational():
+        return None
+    try:
+        return requests.post(f"{OCTOPRINT_URL}api/job",
+                             headers={"X-Api-Key": API_KEY, "Content-Type": "application/json"},
+                             json=body, timeout=6)
+    except Exception as e:
+        logger.error(f"Job command failed: {e}")
+        return None
+
+
+def _do_print():
+    # One click: start the selected file (or resume if paused). On real hardware ARM
+    # is the consent -- no confirmation dialog. Dev is ungated. Motion-gated.
+    s = _plink.snapshot()
+    if not (PrinterLink._operational(s) and _motion_permitted()):
+        return
+    if s["flags"].get("paused"):
+        _post_job({"command": "pause", "action": "resume"})
+    elif s.get("job_file"):
+        _post_job({"command": "start"})
+
+
+def _do_pause():
+    _post_job({"command": "pause", "action": "pause"})   # always live while connected
+
+
+def _do_cancel():
+    _post_job({"command": "cancel"})                     # always live while connected
+
+
+def _set_armed(val):
+    global _ARMED
+    _ARMED = bool(val)
+    logger.warning("ARM MOTION %s" % ("ON — interactive motion enabled" if _ARMED
+                                      else "off — motion locked out"))
+
+
 # =========================
 # LIVE AIRBRUSH MARKER (canvas)
 # =========================
@@ -997,7 +1139,7 @@ def compute_marker():
     generated path by file-progress (estimated/hollow) and snap to a real M114
     position whenever a fresh one arrives (solid)."""
     s = _plink.snapshot()
-    spraying = bool(s.get("spraying"))
+    spraying = bool(s.get("servo_angle"))   # one source of truth: the commanded angle
     printing = bool(s["flags"].get("printing"))
     pos = s.get("pos")
     pos_fresh = s.get("pos_age", 1e9) < 1.5   # a real position line just arrived -> snap
@@ -1034,6 +1176,126 @@ def update_marker():
         pass
     try:
         root.after(200, update_marker)
+    except Exception:
+        pass
+
+
+# =========================
+# TERMINAL PANEL (OctoPrint comm)
+# =========================
+# Gcode words that count as motion/actuation and therefore need the PI motion
+# confirmation. Kept in ONE place so terminal + any future caller share the list.
+# Motion/actuation words (for classification/tests). The terminal GATE itself is an
+# allowlist: only QUERY_COMMANDS (+ e-stop) send while disarmed on real hardware.
+MOTION_COMMANDS = frozenset({"G0", "G1", "G2", "G3", "G5", "G6", "G28", "G38",
+                             "G92", "M280", "M290", "M42"})
+QUERY_COMMANDS = frozenset({"M105", "M114", "M115"})   # always safe to send
+ALWAYS_ALLOWED = frozenset({"M112"})                   # emergency stop -- never gated
+
+_terminal_history = []
+_terminal_hist_idx = [0]
+
+
+def _terminal_command_allowed(cmd):
+    """M112 e-stop always; dev or ARMed real hardware -> everything; disarmed real
+    hardware -> queries only (fail-safe: unknown/unlisted words are blocked)."""
+    w = _command_word(cmd)
+    if w in ALWAYS_ALLOWED:
+        return True
+    if not _real_hardware() or _ARMED:
+        return True
+    return w in QUERY_COMMANDS
+
+
+def _command_word(cmd):
+    """First real gcode word the way the firmware sees it: drop a leading line
+    number (N123) and any '(...)'/';' comments, then read the G/M word.
+    'N10 M280 P0 S5'->'M280'; 'G1 (move) X10'->'G1'; 'g00 X1'->'G0'."""
+    if cmd is None:
+        return None
+    s = re.sub(r"\(.*?\)", " ", cmd)       # drop (...) comments
+    s = s.split(";", 1)[0]                  # drop ; comment
+    s = re.sub(r"^\s*N\d+\b", "", s)         # drop a leading line number
+    m = re.match(r"\s*([GgMm])\s*(\d+)", s)
+    return ("%s%d" % (m.group(1).upper(), int(m.group(2)))) if m else None
+
+
+def _is_motion_command(cmd):
+    return _command_word(cmd) in MOTION_COMMANDS
+
+
+def _terminal_send():
+    if not _plink.is_operational():
+        logger.info("Terminal: printer not connected; nothing sent.")
+        return
+    raw = terminal_input.get("1.0", "end")
+    cmds = []
+    for line in raw.splitlines():
+        line = line.split(";", 1)[0].strip()   # strip inline/line comments and blanks
+        if line:
+            cmds.append(line)
+    terminal_input.delete("1.0", "end")
+    if not cmds:
+        return
+    _terminal_history.append("\n".join(cmds))
+    _terminal_hist_idx[0] = len(_terminal_history)
+    to_send = []
+    for c in cmds:
+        if not _terminal_command_allowed(c):
+            logger.info("Terminal: blocked (%s): %s"
+                        % ("disarmed" if _real_hardware() else "not permitted", c))
+            continue
+        to_send.append(c)
+        if _command_word(c) == "M280":            # keep the angle indicator in lock-step
+            sm = re.search(r"[Ss]\s*(\d+)", c)
+            if sm:
+                _plink.note_servo(int(sm.group(1)))
+    if not to_send:
+        return
+    try:
+        r = requests.post(f"{OCTOPRINT_URL}api/printer/command",
+                          headers={"X-Api-Key": API_KEY, "Content-Type": "application/json"},
+                          json={"commands": to_send}, timeout=6)
+        if r.status_code not in (200, 204):
+            logger.error(f"Terminal send failed: {r.status_code} - {r.text}")
+    except Exception as e:
+        logger.error(f"Terminal send failed: {e}")
+
+
+def _terminal_history_nav(direction):
+    if not _terminal_history:
+        return "break"
+    idx = max(0, min(len(_terminal_history), _terminal_hist_idx[0] + direction))
+    _terminal_hist_idx[0] = idx
+    terminal_input.delete("1.0", "end")
+    if idx < len(_terminal_history):
+        terminal_input.insert("1.0", _terminal_history[idx])
+    return "break"
+
+
+def _terminal_drain():
+    # Mirror OctoPrint's comm stream (from the SAME push socket) into the log.
+    try:
+        appended = False
+        while True:
+            try:
+                line = _plink._log_q.get_nowait()
+            except queue.Empty:
+                break
+            terminal_log.configure(state="normal")
+            terminal_log.insert("end", line + "\n")
+            appended = True
+        if appended:
+            count = int(terminal_log.index("end-1c").split(".")[0])
+            if count > 800:
+                terminal_log.delete("1.0", f"{count-600}.0")
+            if terminal_autoscroll_var.get():
+                terminal_log.see("end")
+            terminal_log.configure(state="disabled")
+    except Exception:
+        pass
+    try:
+        root.after(150, _terminal_drain)
     except Exception:
         pass
 
@@ -1366,16 +1628,16 @@ def path_clicked(event=None): #executed when path from listbox is selected
 # SETUP  & SHUTDOWN
 # =========================
 def background_setup(): # connects to arduino and connects printer to octoprint
-    # OPEN arduino connection once at the start
-    if ARDUINO_PORT is None:
-        logger.info("No Arduino port configured for this target (UCEI_TARGET); skipping serial connection.")
-    else:
-        try:
-            ser = serial.Serial(ARDUINO_PORT, 250000)
-            logger.info("Successfully  connected to Servo")
-            time.sleep(2) # Wait for the reboot
-        except:
-            logger.error("Could not connect to arduino. Check the port name!")
+    # OPEN the arduino serial connection once at the start (as-original -- zero-drift).
+    # It is never written to today (no ser.write anywhere), so it emits no motion
+    # bytes; if a raw servo write is ever added it MUST go through _motion_permitted().
+    # On a Pi where OctoPrint holds the printer port this open simply fails and logs.
+    try:
+        ser = serial.Serial(ARDUINO_PORT, 250000)
+        logger.info("Successfully  connected to Servo")
+        time.sleep(2) # Wait for the reboot
+    except:
+        logger.error("Could not connect to arduino. Check the port name!")
 
     headers = {
         "X-Api-Key": API_KEY,
@@ -1399,11 +1661,11 @@ def background_setup(): # connects to arduino and connects printer to octoprint
         logger.error(f"Failed to connect to OctoPrint/printer: {e}")
 
 
-    # Safety gate: only home (G28) on startup when the active profile allows it.
-    # PI (real hardware) sets allow_startup_motion=False so nothing moves on launch.
-    if not ALLOW_STARTUP_MOTION:
-        logger.warning(f"[{TARGET}] Startup motion disabled (allow_startup_motion=False); "
-                       "skipping G28 homing on startup.")
+    # Startup homing (G28) runs only when talking to a LOOPBACK OctoPrint (Pi-local
+    # or PC-virtual) -- exactly as the original did. Suppressed for a remote host so a
+    # PC never homes a remote Pi's printer. Independent of ARM (zero-drift on the Pi).
+    if not STARTUP_HOMING:
+        logger.info("Startup homing suppressed (remote OctoPrint host); skipping G28.")
     else:
         payload = {"commands": ["G28 X Y"]}
         try:
@@ -1709,6 +1971,34 @@ gui_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
 logger.addHandler(gui_handler)
 ###### LOG / FEEDBACK BOX #######
 
+###### TERMINAL PANEL (OctoPrint comm) ######
+term_frame = tk.Frame(root)
+term_frame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 8))
+
+_term_header = tk.Frame(term_frame)
+_term_header.pack(fill="x")
+tk.Label(_term_header, text="Terminal (OctoPrint comm):", font=("Lexend", 12)).pack(side="left", anchor="w")
+terminal_autoscroll_var = tk.BooleanVar(value=True)
+tk.Checkbutton(_term_header, text="Autoscroll", variable=terminal_autoscroll_var).pack(side="right")
+
+_term_scroll = tk.Scrollbar(term_frame)
+_term_scroll.pack(side="right", fill="y")
+terminal_log = tk.Text(term_frame, height=8, state="disabled", yscrollcommand=_term_scroll.set)
+terminal_log.pack(fill="x")
+_term_scroll.config(command=terminal_log.yview)
+
+_term_input_row = tk.Frame(term_frame)
+_term_input_row.pack(fill="x", pady=(4, 0))
+terminal_send_button = ctk.CTkButton(_term_input_row, text="Send", width=70, command=lambda: _terminal_send())
+terminal_send_button.pack(side="right", padx=(6, 0))
+terminal_input = tk.Text(_term_input_row, height=2)
+terminal_input.pack(side="left", fill="x", expand=True)
+terminal_input.bind("<Return>", lambda e: (_terminal_send(), "break")[1])   # Enter sends
+terminal_input.bind("<Shift-Return>", lambda e: None)                        # Shift+Enter = newline
+terminal_input.bind("<Up>", lambda e: _terminal_history_nav(-1))
+terminal_input.bind("<Down>", lambda e: _terminal_history_nav(1))
+###### TERMINAL PANEL ######
+
 # ##### White Canvas above selectors
 canvas = tk.Canvas(root, width=CANVAS_W, height=CANVAS_H, bg="white")
 canvas.grid(row = 0, column=1) # Put the Canvas in row 0, col 0 
@@ -1762,14 +2052,34 @@ jog_feedrate_entry.grid(row=0, column=1)
 x_coord_str = ctk.StringVar(value="X: —")
 y_coord_str = ctk.StringVar(value="Y: —")
 z_coord_str = ctk.StringVar(value="Z: —")
+servo_angle_str = ctk.StringVar(value="Servo (commanded): —")
 readout = ctk.CTkFrame(jog_panel, fg_color="transparent")
 readout.grid(row=6, column=0, columnspan=4, pady=(6, 2))
 ctk.CTkLabel(readout, textvariable=x_coord_str, font=ctk.CTkFont(size=14, weight="bold"), text_color="#3b8ed0").grid(row=0, column=0, padx=6)
 ctk.CTkLabel(readout, textvariable=y_coord_str, font=ctk.CTkFont(size=14, weight="bold"), text_color="#3b8ed0").grid(row=0, column=1, padx=6)
 ctk.CTkLabel(readout, textvariable=z_coord_str, font=ctk.CTkFont(size=14, weight="bold"), text_color="#3b8ed0").grid(row=0, column=2, padx=6)
+ctk.CTkLabel(readout, textvariable=servo_angle_str, font=ctk.CTkFont(size=13, weight="bold"), text_color="#ff8f00").grid(row=1, column=0, columnspan=3, pady=(4, 0))
 
 panel_note = ctk.CTkLabel(jog_panel, text="Jog via OctoPrint printhead API; greys out when busy/offline")
 panel_note.grid(row=7, column=0, columnspan=4, pady=(4, 0))
+
+###### MACHINE CONTROLS: ARM + one-click Print / Pause / Cancel ######
+_arm_var = tk.BooleanVar(value=False)
+arm_switch = ctk.CTkSwitch(jog_panel, text="ARM MOTION", variable=_arm_var,
+                           command=lambda: _set_armed(_arm_var.get()),
+                           progress_color="#e53935", button_color="#e53935",
+                           font=ctk.CTkFont(size=14, weight="bold"))
+arm_switch.grid(row=8, column=0, columnspan=4, pady=(10, 2))
+print_button = ctk.CTkButton(jog_panel, text="Print — select a file", command=lambda: _do_print())
+print_button.grid(row=9, column=0, columnspan=4, padx=2, pady=(4, 2), sticky="ew")
+_pc_row = ctk.CTkFrame(jog_panel, fg_color="transparent")
+_pc_row.grid(row=10, column=0, columnspan=4, pady=(2, 4))
+pause_button = ctk.CTkButton(_pc_row, text="Pause", width=70, command=lambda: _do_pause())
+pause_button.grid(row=0, column=0, padx=3)
+cancel_button = ctk.CTkButton(_pc_row, text="Cancel", width=70, fg_color="#b71c1c",
+                              hover_color="#7f0000", command=lambda: _do_cancel())
+cancel_button.grid(row=0, column=1, padx=3)
+###### MACHINE CONTROLS ######
 
 # Widgets greyed out unless Operational & idle (managed in update_gui_coordinates)
 _jog_widgets = [home_xy_button, home_all_button, xbutton_left, xbutton_right,
@@ -1779,6 +2089,7 @@ _jog_widgets = [home_xy_button, home_all_button, xbutton_left, xbutton_right,
 _plink.start()            # begin the OctoPrint push-socket link
 update_gui_coordinates()  # start readout + gating loop
 update_marker()           # start the live airbrush marker on the canvas
+_terminal_drain()         # start mirroring OctoPrint's comm stream into the terminal
 ##### Jog Panel #######
 
 if __name__ == "__main__":

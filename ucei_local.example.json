@@ -1,0 +1,6 @@
+{
+  "_comment": "Copy this file to ucei_local.json (git-ignored) to override the built-in Pi defaults on Windows / for a remote OctoPrint. Omit any key to keep its default. A missing or malformed ucei_local.json is ignored and the program falls back to the originals (127.0.0.1:5001, /dev/ttyACM0, the repo API key).",
+  "api_key": "PUT_YOUR_OCTOPRINT_API_KEY_HERE",
+  "com_port": "COM3",
+  "remote_host": "127.0.0.1"
+}

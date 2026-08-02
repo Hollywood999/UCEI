@@ -10,5 +10,6 @@ env/
 __pycache__/
 offset.gcode
 
-# Local secrets -- never commit API keys (see LOCAL profile in config.py)
-config_local.py
+# Local overrides / secrets -- never commit. Built-in defaults are the Pi's;
+# ucei_local.json (see ucei_local.example.json) overrides them on Windows/remote.
+ucei_local.json
